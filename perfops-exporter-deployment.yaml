@@ -17,7 +17,9 @@ spec:  # Ensures one replica of the pod is always running.
       labels:
         app: perfops-exporter      # Annotations for automatic discovery by Prometheus. 
       annotations:
-        prometheus.io/scrape: 'true'        prometheus.io/path: '/metrics' # The endpoint for metrics.         prometheus.io/port: '8000'    # The port to scrape. 
+        prometheus.io/scrape: 'true'
+        prometheus.io/path: '/metrics' # The endpoint for metrics.
+        prometheus.io/port: '8000'    # The port to scrape. 
     spec:
       containers:
       - name: perfops-exporter-container
