@@ -3,7 +3,8 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from prometheus_client import start_http_server, Histogram, Counter
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 # --- Configuration ---
 API_KEY = os.environ.get("PERFOPS_API_KEY")
@@ -13,8 +14,13 @@ HEADERS = {
     "Authorization": f"{API_KEY}",
     "Content-Type": "application/json"
 }
-SCRAPE_INTERVAL = 120
-EXPORTER_PORT = 8000
+SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "120"))
+
+# InfluxDB Configuration
+INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://localhost:8086")
+INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
+INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "perfops")
+INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "perfops_cdn")
 
 # Fetch providers at startup
 provider_map = {}
@@ -37,63 +43,8 @@ def get_provider_name(cdnid):
         return provider_map[cdnid]
     return f"CDN_{cdnid}"
 
-# --- Prometheus Metric Definitions ---
-# Base labels to include on almost everything
-LABELS = ['provider_name', 'continent', 'country', 'city']
-EXTENDED_LABELS = LABELS + ['platform', 'httpVersion']
-
-# Histograms (converting ms to seconds)
-# Using standard prometheus buckets (default is usually up to 10s)
-TTFB_HISTOGRAM = Histogram(
-    'perfops_cdn_ttfb_seconds',
-    'CDN Time To First Byte from PerfOps',
-    EXTENDED_LABELS
-)
-DNS_HISTOGRAM = Histogram(
-    'perfops_cdn_dns_lookup_seconds',
-    'CDN DNS Lookup Time from PerfOps',
-    LABELS
-)
-TCP_HISTOGRAM = Histogram(
-    'perfops_cdn_tcp_connect_seconds',
-    'CDN TCP Connect Time from PerfOps',
-    LABELS
-)
-SSL_HISTOGRAM = Histogram(
-    'perfops_cdn_ssl_handshake_seconds',
-    'CDN SSL Handshake Time from PerfOps',
-    LABELS
-)
-TRANSFER_HISTOGRAM = Histogram(
-    'perfops_cdn_transfer_seconds',
-    'CDN Data Transfer Time from PerfOps',
-    LABELS
-)
-TOTAL_LATENCY_HISTOGRAM = Histogram(
-    'perfops_cdn_total_latency_seconds',
-    'CDN Total Latency from PerfOps',
-    EXTENDED_LABELS
-)
-
-# Counters
-CACHE_STATUS_COUNTER = Counter(
-    'perfops_cdn_cache_status_total',
-    'CDN cache status from PerfOps',
-    ['provider_name', 'continent', 'country', 'cache_status']
-)
-HTTP_STATUS_COUNTER = Counter(
-    'perfops_cdn_http_status_total',
-    'CDN HTTP status codes from PerfOps',
-    ['provider_name', 'continent', 'country', 'status_code']
-)
-FAILURE_COUNTER = Counter(
-    'perfops_cdn_failures_total',
-    'CDN failure reasons from PerfOps',
-    ['provider_name', 'continent', 'country', 'failure_reason']
-)
-
 # --- Data Fetching and Processing ---
-def process_logs():
+def process_logs(write_api):
     now = datetime.now(timezone.utc)
     # Query the last SCRAPE_INTERVAL seconds, plus a small buffer
     start_time = now - timedelta(seconds=SCRAPE_INTERVAL + 10)
@@ -137,6 +88,7 @@ def process_logs():
         # Map column names to their index
         col_idx = {name: idx for idx, name in enumerate(columns)}
         
+        points = []
         for row in values:
             # Helper to extract value safely
             def get_val(col_name, default=None):
@@ -157,70 +109,56 @@ def process_logs():
             platform = str(get_val('platform', 'unknown'))
             http_version = str(get_val('httpVersion', 'unknown'))
             
-            base_labels = {
-                'provider_name': provider_name,
-                'continent': continent,
-                'country': country,
-                'city': city
-            }
-            ext_labels = dict(base_labels)
-            ext_labels.update({
-                'platform': platform,
-                'httpVersion': http_version
-            })
+            cache = get_val('cache')
+            cache_status = 'hit' if cache == 1 else 'miss' if cache == 0 else str(cache)
+            status_code = str(get_val('statusCode', 'unknown'))
+            failure_reason = str(get_val('failureReason', 'NONE'))
 
-            # Record Histograms (convert ms to seconds)
+            point = Point("perfops_cdn_logs") \
+                .tag("provider_name", provider_name) \
+                .tag("continent", continent) \
+                .tag("country", country) \
+                .tag("city", city) \
+                .tag("platform", platform) \
+                .tag("httpVersion", http_version) \
+                .tag("cache_status", cache_status) \
+                .tag("status_code", status_code) \
+                .tag("failure_reason", failure_reason)
+
+            # Record Fields (keeping them as ms to preserve precision)
             ttfb = get_val('ttfb')
             if isinstance(ttfb, (int, float)) and ttfb > 0:
-                TTFB_HISTOGRAM.labels(**ext_labels).observe(ttfb / 1000.0)
+                point = point.field("ttfb_ms", float(ttfb))
                 
             dns = get_val('dnsLookupTimeMs')
             if isinstance(dns, (int, float)) and dns >= 0:
-                DNS_HISTOGRAM.labels(**base_labels).observe(dns / 1000.0)
+                point = point.field("dns_lookup_ms", float(dns))
                 
             tcp = get_val('tcpTimeMs')
             if isinstance(tcp, (int, float)) and tcp >= 0:
-                TCP_HISTOGRAM.labels(**base_labels).observe(tcp / 1000.0)
+                point = point.field("tcp_connect_ms", float(tcp))
                 
             ssl = get_val('sslTimeMs')
             if isinstance(ssl, (int, float)) and ssl >= 0:
-                SSL_HISTOGRAM.labels(**base_labels).observe(ssl / 1000.0)
+                point = point.field("ssl_handshake_ms", float(ssl))
                 
             transfer = get_val('transferTime')
             if isinstance(transfer, (int, float)) and transfer >= 0:
-                TRANSFER_HISTOGRAM.labels(**base_labels).observe(transfer / 1000.0)
+                point = point.field("transfer_ms", float(transfer))
                 
             total_ms = get_val('ms')
             if isinstance(total_ms, (int, float)) and total_ms > 0:
-                TOTAL_LATENCY_HISTOGRAM.labels(**ext_labels).observe(total_ms / 1000.0)
+                point = point.field("total_latency_ms", float(total_ms))
 
-            # Record Counters
-            # Cache status (usually 1 for HIT, 0 for MISS, etc.)
-            cache = get_val('cache')
-            cache_status = 'hit' if cache == 1 else 'miss' if cache == 0 else str(cache)
-            CACHE_STATUS_COUNTER.labels(
-                provider_name=provider_name,
-                continent=continent,
-                country=country,
-                cache_status=cache_status
-            ).inc()
+            # Set write time
+            # The raw logs don't provide an exact timestamp per row, so we use the fetch time.
+            point = point.time(now, WritePrecision.NS)
 
-            status_code = str(get_val('statusCode', 'unknown'))
-            HTTP_STATUS_COUNTER.labels(
-                provider_name=provider_name,
-                continent=continent,
-                country=country,
-                status_code=status_code
-            ).inc()
-            
-            failure = str(get_val('failureReason', 'NONE'))
-            if failure and failure != 'NONE':
-                FAILURE_COUNTER.labels(
-                    provider_name=provider_name,
-                    continent=continent,
-                    country=country,
-                    failure_reason=failure
-                ).inc()
+            points.append(point)
+
+        if points:
+            write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=points)
+            print(f"Successfully wrote {len(points)} points to InfluxDB.")
 
     except requests.exceptions.RequestException as e:
         print(f"Error fetching data from PerfOps API: {e}")
@@ -233,12 +171,24 @@ def process_logs():
 if __name__ == '__main__':
     if not API_KEY:
         print("Error: PERFOPS_API_KEY environment variable not set. Exiting.")
-    else:
-        load_providers()
-        start_http_server(EXPORTER_PORT)
-        print(f"Prometheus exporter started on port {EXPORTER_PORT}")
+        exit(1)
+        
+    if not INFLUXDB_TOKEN:
+        print("Error: INFLUXDB_TOKEN environment variable not set. Exiting.")
+        exit(1)
+
+    # Initialize InfluxDB Client
+    client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+
+    load_providers()
+    print(f"Starting PerfOps to InfluxDB exporter. Writing to {INFLUXDB_URL} / bucket: {INFLUXDB_BUCKET}")
+    
+    try:
         while True:
-            process_logs()
+            process_logs(write_api)
             print(f"Waiting for {SCRAPE_INTERVAL} seconds before next fetch.")
             time.sleep(SCRAPE_INTERVAL)
+    finally:
+        client.close()
 

@@ -32,8 +32,5 @@ RUN chown -R nonroot:nonroot /app
 # Switch to the non-root user.
 USER nonroot
 
-# Expose port 8000, which the exporter uses to serve metrics. 
-EXPOSE 8000
-
 # Specify the default command to execute the script. 
 CMD ["python", "./perfops_exporter.py"]

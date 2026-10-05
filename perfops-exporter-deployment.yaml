@@ -15,40 +15,30 @@ spec:  # Ensures one replica of the pod is always running.
   template:
     metadata:
       labels:
-        app: perfops-exporter      # Annotations for automatic discovery by Prometheus. 
-      annotations:
-        prometheus.io/scrape: 'true'
-        prometheus.io/path: '/metrics' # The endpoint for metrics.
-        prometheus.io/port: '8000'    # The port to scrape. 
+        app: perfops-exporter
     spec:
       containers:
       - name: perfops-exporter-container
         # IMPORTANT: Replace with your actual image path from your registry.
         image: your-repo/perfops-exporter:latest
         imagePullPolicy: Always
-        ports:
-        - containerPort: 8000
-          name: http-metrics        # Securely inject the API key from a Kubernetes Secret. 
+        # Securely inject the API keys and configurations from a Kubernetes Secret/ConfigMap. 
         env:
         - name: PERFOPS_API_KEY
-          valueFrom:            # Source the value from a Secret. 
-            secretKeyRef:              # The name of the Secret object. 
-              name: perfops-secret              # The key within the Secret to use. 
+          valueFrom:
+            secretKeyRef:
+              name: perfops-secret
               key: PERFOPS_API_KEY
----
-# --- SERVICE ---
-# Provides a stable network endpoint for the exporter pod. 
-apiVersion: v1
-kind: Service
-metadata:
-  name: perfops-exporter-service
-  labels:
-    app: perfops-exporter
-spec:  # Routes traffic to pods with this label. 
-  selector:
-    app: perfops-exporter
-  ports:
-  - protocol: TCP
-    # The port the Service exposes within the cluster.
-    port: 8000    # The port on the target pod to forward traffic to. 
-    targetPort: http-metrics
+        - name: INFLUXDB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: perfops-secret
+              key: INFLUXDB_TOKEN
+        - name: INFLUXDB_URL
+          value: "http://influxdb.monitoring.svc.cluster.local:8086"
+        - name: INFLUXDB_ORG
+          value: "perfops"
+        - name: INFLUXDB_BUCKET
+          value: "perfops_cdn"
+        - name: SCRAPE_INTERVAL
+          value: "120"

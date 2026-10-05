@@ -1,44 +1,50 @@
 # PerfOps Exporter
 
-PerfOps Exporter is a Prometheus exporter that fetches CDN analytics raw logs from the [PerfOps API](https://perfops.net/) and exposes them as Prometheus metrics. 
+PerfOps Exporter fetches CDN analytics raw logs from the [PerfOps API](https://perfops.net/) and pushes them into an **InfluxDB** time-series database. 
 
-This exporter extracts critical performance and reliability data, including Time To First Byte (TTFB), cache statuses, and HTTP status codes, enriching them with metadata labels such as provider name, country code, ASN, and ISP name.
+This exporter extracts critical performance and reliability data, including Time To First Byte (TTFB), cache statuses, and HTTP status codes, enriching them with metadata tags such as provider name, country code, ASN, city, and platform. 
+
+*Note: This script was previously a Prometheus Exporter but has been rewritten to push data directly to InfluxDB to avoid unbounded memory usage by the script.*
 
 ## Features
 
-- Exposes **TTFB (Time To First Byte)** as a Prometheus Histogram.
-- Exposes **Cache Status** and **HTTP Status** as Prometheus Counters.
-- Enriches metrics with labels: `provider_name`, `country_code`, `asn`, `isp_name`.
+- Pushes **TTFB (Time To First Byte)** and other latency metrics to InfluxDB as fields (in ms).
+- Pushes **Cache Status** and **HTTP Status** to InfluxDB as tags.
+- Enriches metrics with tags: `provider_name`, `continent`, `country`, `city`, `platform`, `httpVersion`.
 - Configurable via environment variables.
 - Docker-ready with a lightweight multi-stage image.
-- Kubernetes deployment ready with Prometheus scraping annotations.
+- Kubernetes deployment ready.
 
 ## Prerequisites
 
 - Python 3.9+
 - A valid [PerfOps API Key](https://perfops.net/)
+- An accessible [InfluxDB v2](https://www.influxdata.com/) server or InfluxDB Cloud instance
 - (Optional) Docker for containerized deployment
 - (Optional) Kubernetes cluster for deployment
 
-## Metrics Reference
+## InfluxDB Schema
 
-The exporter exposes the following metrics on port `8000` at the root path `/` (and can be scraped anywhere, usually `/metrics` is standard for Prometheus but this exposes at root by default using `prometheus_client`'s `start_http_server`):
+Data is written to InfluxDB under the measurement `perfops_cdn_logs`.
 
-| Metric Name | Type | Labels | Description |
-| :--- | :--- | :--- | :--- |
-| `perfops_cdn_ttfb_seconds` | Histogram | `provider_name`, `country_code`, `asn`, `isp_name` | CDN Time To First Byte from PerfOps in seconds. |
-| `perfops_cdn_cache_status_total` | Counter | `provider_name`, `country_code`, `cache_status` | CDN cache status count (e.g., HIT, MISS). |
-| `perfops_cdn_http_status_total` | Counter | `provider_name`, `country_code`, `status_code` | CDN HTTP status codes count (e.g., 200, 404, 5xx). |
+| Data Type | Name | Description |
+| :--- | :--- | :--- |
+| **Measurement** | `perfops_cdn_logs` | The base measurement name. |
+| **Tags** | `provider_name`, `continent`, `country`, `city`, `platform`, `httpVersion`, `cache_status`, `status_code`, `failure_reason` | Indexed metadata to group and filter queries. |
+| **Fields** | `ttfb_ms`, `dns_lookup_ms`, `tcp_connect_ms`, `ssl_handshake_ms`, `transfer_ms`, `total_latency_ms` | Float values representing milliseconds. |
 
 ## Configuration
 
-The exporter requires the following environment variable to authenticate with the PerfOps API:
+The exporter requires the following environment variables to authenticate with the PerfOps API and InfluxDB:
 
-| Environment Variable | Description | Required |
-| :--- | :--- | :--- |
-| `PERFOPS_API_KEY` | Your PerfOps API Key. | Yes |
-
-*Note: The exporter currently defaults to a 120-second scrape interval and binds to port 8000. These can be adjusted by editing `SCRAPE_INTERVAL` and `EXPORTER_PORT` in `perfops_exporter.py`.*
+| Environment Variable | Description | Required | Default |
+| :--- | :--- | :--- | :--- |
+| `PERFOPS_API_KEY` | Your PerfOps API Key. | **Yes** | - |
+| `INFLUXDB_TOKEN` | Your InfluxDB API Token. | **Yes** | - |
+| `INFLUXDB_URL` | The URL of your InfluxDB instance. | No | `http://localhost:8086` |
+| `INFLUXDB_ORG` | Your InfluxDB Organization. | No | `perfops` |
+| `INFLUXDB_BUCKET` | Your InfluxDB Bucket to write into. | No | `perfops_cdn` |
+| `SCRAPE_INTERVAL` | Interval between API fetches in seconds. | No | `120` |
 
 ## Running Locally
 
@@ -53,14 +59,13 @@ The exporter requires the following environment variable to authenticate with th
    pip install -r requirements.txt
    ```
 
-3. **Set the API Key and run the exporter:**
+3. **Set the required environment variables and run the exporter:**
    ```bash
-   export PERFOPS_API_KEY="your_api_key_here"
+   export PERFOPS_API_KEY="your_perfops_api_key_here"
+   export INFLUXDB_TOKEN="your_influxdb_token_here"
+   export INFLUXDB_URL="http://localhost:8086"
    python perfops_exporter.py
    ```
-
-4. **Verify metrics:**
-   Open a browser or use `curl` to visit `http://localhost:8000/`.
 
 ## Running with Docker
 
@@ -72,27 +77,31 @@ The exporter requires the following environment variable to authenticate with th
 
 2. **Run the container:**
    ```bash
-   docker run -d -p 8000:8000 -e PERFOPS_API_KEY="your_api_key_here" perfops-exporter:latest
+   docker run -d \
+     -e PERFOPS_API_KEY="your_api_key_here" \
+     -e INFLUXDB_TOKEN="your_influxdb_token_here" \
+     -e INFLUXDB_URL="http://your-influx-server:8086" \
+     perfops-exporter:latest
    ```
 
 ## Kubernetes Deployment
 
-A deployment manifest is provided for deploying the exporter to a Kubernetes cluster. It includes Prometheus annotations for automatic metric scraping.
+A deployment manifest is provided for deploying the exporter to a Kubernetes cluster. 
 
-1. **Create a Kubernetes Secret for your API key:**
+1. **Create a Kubernetes Secret for your API keys:**
    ```bash
-   kubectl create secret generic perfops-secret --from-literal=PERFOPS_API_KEY='your_api_key_here'
+   kubectl create secret generic perfops-secret \
+     --from-literal=PERFOPS_API_KEY='your_api_key_here' \
+     --from-literal=INFLUXDB_TOKEN='your_influxdb_token_here'
    ```
 
-2. **Update the Docker image reference:**
-   Edit the `perfops-exporter-deployment.yaml` file to replace `your-repo/perfops-exporter:latest` with the actual path to your container registry.
+2. **Update the Deployment Configuration:**
+   Edit the `perfops-exporter-deployment.yaml` file to replace `your-repo/perfops-exporter:latest` with the actual path to your container registry. Update the `INFLUXDB_URL` pointing to your InfluxDB service.
 
-3. **Apply the deployment and service:**
+3. **Apply the deployment:**
    ```bash
    kubectl apply -f perfops-exporter-deployment.yaml
    ```
-
-The exporter will now run as a pod with a service named `perfops-exporter-service` routing traffic to port `8000`. If your Prometheus setup uses Kubernetes annotations, it will automatically discover and scrape the pod.
 
 ## Project Structure
 
@@ -102,5 +111,5 @@ perfops-exporter/
 │   ├── Dockerfile             # Multi-stage lightweight Dockerfile
 │   ├── perfops_exporter.py    # Main exporter script
 │   └── requirements.txt       # Python dependencies
-└── perfops-exporter-deployment.yaml # Kubernetes Deployment & Service manifests
+└── perfops-exporter-deployment.yaml # Kubernetes Deployment manifest
 ```
