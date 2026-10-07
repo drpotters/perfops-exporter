@@ -89,7 +89,8 @@ def process_logs(write_api):
         col_idx = {name: idx for idx, name in enumerate(columns)}
         
         points = []
-        for row in values:
+        base_ns = int(now.timestamp() * 1e9)
+        for i, row in enumerate(values):
             # Helper to extract value safely
             def get_val(col_name, default=None):
                 if col_name in col_idx:
@@ -152,7 +153,7 @@ def process_logs(write_api):
 
             # Set write time
             # The raw logs don't provide an exact timestamp per row, so we use the fetch time.
-            point = point.time(now, WritePrecision.NS)
+            point = point.time(base_ns + i, WritePrecision.NS)
 
             points.append(point)
 
