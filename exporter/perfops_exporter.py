@@ -20,7 +20,7 @@ SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "120"))
 INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://localhost:8086")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "perfops")
-INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "perfops_cdn")
+INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "perfops-cdn")
 
 # Fetch providers at startup
 provider_map = {}
