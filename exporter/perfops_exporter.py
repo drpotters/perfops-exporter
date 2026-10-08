@@ -29,6 +29,15 @@ GEO_CACHE_FILE = os.environ.get("GEO_CACHE_FILE", "geo_cache.json")
 # Nominatim requires an identifying user agent (put your own contact address here)
 GEOCODER_USER_AGENT = os.environ.get("GEOCODER_USER_AGENT", "perfops-exporter (ops@example.com)")
 
+GEO_OVERRIDES = {
+    "Ashburn|United States":  [39.0438, -77.4874],
+    "Pasco|United States":    [46.2396, -119.1006],
+    "Suffolk|United States":  [36.7282, -76.5836],
+    "Alameda|United States":  [37.7652, -122.2416],
+    "Dnipro|Ukraine":         [48.4647, 35.0462],
+    "Ain Beida|Algeria":      [35.7964, 7.3928],
+}
+
 _geolocator = Nominatim(user_agent=GEOCODER_USER_AGENT, timeout=10)
 # Nominatim's usage policy allows at most 1 request per second
 _geocode = RateLimiter(_geolocator.geocode, min_delay_seconds=1.1,
@@ -55,10 +64,13 @@ def save_geo_cache():
 
 def get_city_coords(city, country):
     """Return [lat, lon] for a city, or None. Results (including misses) are cached on disk."""
-    if not city or city in ("unknown", "None"):
+    if not city or city in ("unknown", "None", "?", ""):
         return None
 
     key = f"{city}|{country}"
+    if key in GEO_OVERRIDES:
+        return GEO_OVERRIDES[key]
+
     if key in geo_cache:
         return geo_cache[key]
 
@@ -234,6 +246,8 @@ def process_logs(write_api):
 
     except requests.exceptions.RequestException as e:
         print(f"Error fetching data from PerfOps API: {e}")
+    except ApiException as e:
+        print(f"InfluxDB write failed ({e.status}): {e.body}")
     except Exception as e:
         import traceback
         print(f"An unexpected error occurred: {e}")
