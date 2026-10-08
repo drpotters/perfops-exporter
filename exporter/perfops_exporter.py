@@ -5,6 +5,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
 # --- Configuration ---
 API_KEY = os.environ.get("PERFOPS_API_KEY")
@@ -21,6 +23,66 @@ INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://localhost:8086")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "perfops")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "perfops-cdn")
+
+# --- Geocoding configuration ---
+GEO_CACHE_FILE = os.environ.get("GEO_CACHE_FILE", "geo_cache.json")
+# Nominatim requires an identifying user agent (put your own contact address here)
+GEOCODER_USER_AGENT = os.environ.get("GEOCODER_USER_AGENT", "perfops-exporter (ops@example.com)")
+
+_geolocator = Nominatim(user_agent=GEOCODER_USER_AGENT, timeout=10)
+# Nominatim's usage policy allows at most 1 request per second
+_geocode = RateLimiter(_geolocator.geocode, min_delay_seconds=1.1,
+                       max_retries=2, error_wait_seconds=5)
+
+
+def load_geo_cache():
+    try:
+        with open(GEO_CACHE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+geo_cache = load_geo_cache()
+
+
+def save_geo_cache():
+    tmp = GEO_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(geo_cache, f)
+    os.replace(tmp, GEO_CACHE_FILE)   # atomic write so the cache never gets corrupted
+
+
+def get_city_coords(city, country):
+    """Return [lat, lon] for a city, or None. Results (including misses) are cached on disk."""
+    if not city or city in ("unknown", "None"):
+        return None
+
+    key = f"{city}|{country}"
+    if key in geo_cache:
+        return geo_cache[key]
+
+    kwargs = {}
+    if len(country) == 2 and country.isalpha():        # ISO-2 code, e.g. "US", "DE"
+        kwargs["country_codes"] = country.lower()
+        query = city
+    elif country and country != "unknown":             # full country name
+        query = f"{city}, {country}"
+    else:
+        query = city
+
+    try:
+        loc = _geocode(query, **kwargs)
+    except Exception as e:
+        print(f"Geocoding failed for '{query}': {e}")   # temporary error: don't cache, retry next time
+        return None
+
+    coords = [round(loc.latitude, 4), round(loc.longitude, 4)] if loc else None
+    if coords is None:
+        print(f"No geocoding result for '{query}' ({country})")
+    geo_cache[key] = coords
+    save_geo_cache()
+    return coords
 
 # Fetch providers at startup
 provider_map = {}
@@ -89,8 +151,8 @@ def process_logs(write_api):
         col_idx = {name: idx for idx, name in enumerate(columns)}
         
         points = []
-        base_ns = int(now.timestamp() * 1e9)
-        for i, row in enumerate(values):
+        base_ns = int(now.timestamp() * 1e9)    # NEW: base timestamp in nanoseconds
+        for i, row in enumerate(values):        # CHANGED: enumerate so each row gets a unique time
             # Helper to extract value safely
             def get_val(col_name, default=None):
                 if col_name in col_idx:
@@ -151,10 +213,19 @@ def process_logs(write_api):
             if isinstance(total_ms, (int, float)) and total_ms > 0:
                 point = point.field("total_latency_ms", float(total_ms))
 
-            # Set write time
-            # The raw logs don't provide an exact timestamp per row, so we use the fetch time.
-            point = point.time(base_ns + i, WritePrecision.NS)
+            # NEW: coordinates – use the API's own columns if present, otherwise geocode
+            api_lat = get_val('latitude', get_val('lat'))
+            api_lon = get_val('longitude', get_val('lon'))
+            if isinstance(api_lat, (int, float)) and isinstance(api_lon, (int, float)):
+                coords = [float(api_lat), float(api_lon)]
+            else:
+                coords = get_city_coords(city, country)
 
+            if coords:
+                point = point.field("lat", float(coords[0])).field("lon", float(coords[1]))
+
+            # CHANGED: unique timestamp per row (replaces point.time(now, ...))
+            point = point.time(base_ns + i, WritePrecision.NS)
             points.append(point)
 
         if points:

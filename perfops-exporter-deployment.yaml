@@ -1,4 +1,20 @@
 # perfops-exporter.yaml
+# --- PERSISTENT VOLUME CLAIM ---                                    # NEW
+# Stores the geocoding cache (geo_cache.json) across pod restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: perfops-exporter-data
+  labels:
+    app: perfops-exporter
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName: standard   # uncomment/set if your cluster has no default StorageClass
+  resources:
+    requests:
+      storage: 100Mi              # the cache is only KBs; this is plenty
+---
 # --- DEPLOYMENT ---
 # Manages the lifecycle of the perfops-exporter pod. 
 apiVersion: apps/v1
@@ -39,6 +55,24 @@ spec:  # Ensures one replica of the pod is always running.
         - name: INFLUXDB_ORG
           value: "perfops"
         - name: INFLUXDB_BUCKET
-          value: "perfops_cdn"
+          value: "perfops-cdn"
         - name: SCRAPE_INTERVAL
           value: "120"
+        # NEW: geocoding cache on the persistent volume
+        - name: GEO_CACHE_FILE
+          value: "/data/geo_cache.json"
+        # NEW: Nominatim requires an identifying User-Agent with a contact address
+        - name: GEOCODER_USER_AGENT
+          value: "perfops-exporter (your-team@yourcompany.com)"
+        # NEW: show print() output in `kubectl logs` immediately
+        - name: PYTHONUNBUFFERED
+          value: "1"
+      # NEW: mount the PVC
+      volumeMounts:
+        - name: exporter-data
+          mountPath: /data
+  # NEW: link the PVC to the pod
+  volumes:
+    - name: exporter-data
+      persistentVolumeClaim:
+        claimName: perfops-exporter-data
