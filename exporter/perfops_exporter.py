@@ -12,6 +12,7 @@ from geopy.extra.rate_limiter import RateLimiter
 API_KEY = os.environ.get("PERFOPS_API_KEY")
 BASE_URL = "https://api.perfops.net/analytics/cdn/raw-logs"
 PROVIDERS_URL = "https://api.perfops.net/analytics/cdn/provider"
+PROVIDER_REFRESH = int(os.environ.get("PROVIDER_REFRESH", "3600"))
 HEADERS = {
     "Authorization": f"{API_KEY}",
     "Content-Type": "application/json"
@@ -42,7 +43,6 @@ _geolocator = Nominatim(user_agent=GEOCODER_USER_AGENT, timeout=10)
 # Nominatim's usage policy allows at most 1 request per second
 _geocode = RateLimiter(_geolocator.geocode, min_delay_seconds=1.1,
                        max_retries=2, error_wait_seconds=5)
-
 
 def load_geo_cache():
     try:
@@ -98,24 +98,25 @@ def get_city_coords(city, country):
 
 # Fetch providers at startup
 provider_map = {}
+providers_loaded_at = 0.0
 
 def load_providers():
-    global provider_map
+    global provider_map, providers_loaded_at
     print("Loading CDN providers...")
     try:
         response = requests.get(PROVIDERS_URL, headers=HEADERS, timeout=30)
         response.raise_for_status()
-        providers = response.json()
-        for p in providers:
-            provider_map[p.get('id')] = p.get('name', f"Provider_{p.get('id')}")
+        new_map = {str(p.get('id')): p.get('name') or f"Provider_{p.get('id')}"
+                   for p in response.json()}
+        if new_map:
+            provider_map = new_map
+            providers_loaded_at = time.time()
         print(f"Loaded {len(provider_map)} CDN providers.")
     except Exception as e:
         print(f"Warning: Could not load CDN providers list: {e}")
 
 def get_provider_name(cdnid):
-    if cdnid in provider_map:
-        return provider_map[cdnid]
-    return f"CDN_{cdnid}"
+    return provider_map.get(str(cdnid), f"CDN_{cdnid}")
 
 # --- Data Fetching and Processing ---
 def process_logs(write_api):
@@ -273,6 +274,8 @@ if __name__ == '__main__':
     try:
         while True:
             process_logs(write_api)
+            if not provider_map or time.time() - providers_loaded_at > PROVIDER_REFRESH:
+                load_providers()
             print(f"Waiting for {SCRAPE_INTERVAL} seconds before next fetch.")
             time.sleep(SCRAPE_INTERVAL)
     finally:
