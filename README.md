@@ -43,8 +43,27 @@ The exporter requires the following environment variables to authenticate with t
 | `INFLUXDB_TOKEN` | Your InfluxDB API Token. | **Yes** | - |
 | `INFLUXDB_URL` | The URL of your InfluxDB instance. | No | `http://localhost:8086` |
 | `INFLUXDB_ORG` | Your InfluxDB Organization. | No | `perfops` |
-| `INFLUXDB_BUCKET` | Your InfluxDB Bucket to write into. | No | `perfops_cdn` |
+| `INFLUXDB_BUCKET` | Your InfluxDB Bucket to write into. | No | `perfops-cdn` |
 | `SCRAPE_INTERVAL` | Interval between API fetches in seconds. | No | `120` |
+
+### Backfill & Resiliency Configuration
+
+The exporter maintains a checkpoint file to ensure it can resume scraping from where it left off after a crash or maintenance downtime, up to the 48-hour API retention limit.
+
+| Environment Variable | Description | Default |
+| :--- | :--- | :--- |
+| `CHECKPOINT_FILE` | Where progress is saved to resume after a restart. | `/data/checkpoint.json` |
+| `MAX_BACKFILL_HOURS` | Longest gap it will go back and fill (PerfOps retention limit is 48h). | `48` |
+| `RETENTION_SAFETY_MINUTES` | Stays clear of logs about to expire at the 48h edge. | `5` |
+| `BACKFILL_CHUNK_MINUTES` | Size of each catch-up window requested from the API. | `10` |
+| `OVERLAP_SECONDS` | Re-reads a little of the last window to catch late-arriving logs. | `60` |
+| `INGEST_LAG_SECONDS` | Optional delay before reading recent logs to wait for pipeline flush. | `0` |
+| `INITIAL_BACKFILL_HOURS` | Used for the very first run when no checkpoint exists. Defaults to 0 (today's behavior). Set to 48 for a full initial pull. | `0` |
+| `BACKFILL_REQUEST_DELAY` | Pause in seconds between catch-up requests. | `0.5` |
+| `MAX_PAGES_PER_WINDOW` | Safety limit on how many pages to fetch per time chunk. | `500` |
+
+> **Note on Backfill Behavior:** 
+> When the exporter restarts, it will fetch historical logs in smaller chunks (defined by `BACKFILL_CHUNK_MINUTES`) oldest-first until it reaches the present. If the outage exceeds `MAX_BACKFILL_HOURS` (48 hours), you will see a warning in the logs indicating an unrecoverable gap. Data replayed this way will be written to InfluxDB using the actual event time in the log instead of the scrape time, allowing accurate historical graph plotting.
 
 ## Running Locally
 

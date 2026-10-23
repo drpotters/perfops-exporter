@@ -24,7 +24,9 @@ metadata:
   labels:
     app: perfops-exporter
 spec:  # Ensures one replica of the pod is always running. 
-  replicas: 1  # Links the Deployment to the pods it manages via labels. 
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: perfops-exporter  # Blueprint for the pods created by this Deployment. 
@@ -33,6 +35,8 @@ spec:  # Ensures one replica of the pod is always running.
       labels:
         app: perfops-exporter
     spec:
+      securityContext:
+        fsGroup: 10001
       containers:
       - name: perfops-exporter-container
         # IMPORTANT: Replace with your actual image path from your registry.
@@ -58,21 +62,34 @@ spec:  # Ensures one replica of the pod is always running.
           value: "perfops-cdn"
         - name: SCRAPE_INTERVAL
           value: "120"
-        # NEW: geocoding cache on the persistent volume
+        - name: CHECKPOINT_FILE
+          value: "/data/checkpoint.json"
+        - name: MAX_BACKFILL_HOURS
+          value: "48"
+        - name: RETENTION_SAFETY_MINUTES
+          value: "5"
+        - name: BACKFILL_CHUNK_MINUTES
+          value: "10"
+        - name: OVERLAP_SECONDS
+          value: "60"
+        - name: INGEST_LAG_SECONDS
+          value: "0"
+        - name: BACKFILL_REQUEST_DELAY
+          value: "0.5"
+        - name: MAX_PAGES_PER_WINDOW
+          value: "500"
         - name: GEO_CACHE_FILE
           value: "/data/geo_cache.json"
-        # NEW: Nominatim requires an identifying User-Agent with a contact address
         - name: GEOCODER_USER_AGENT
           value: "perfops-exporter (your-team@yourcompany.com)"
-        # NEW: show print() output in `kubectl logs` immediately
         - name: PYTHONUNBUFFERED
           value: "1"
-      # NEW: mount the PVC
-      volumeMounts:
+        # NEW: mount the PVC
+        volumeMounts:
+          - name: exporter-data
+            mountPath: /data
+      # NEW: link the PVC to the pod
+      volumes:
         - name: exporter-data
-          mountPath: /data
-  # NEW: link the PVC to the pod
-  volumes:
-    - name: exporter-data
-      persistentVolumeClaim:
-        claimName: perfops-exporter-data
+          persistentVolumeClaim:
+            claimName: perfops-exporter-data

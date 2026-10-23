@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1
 
 # Create a non-root user and group for security.
 # Running containers as a non-root user is a critical security best practice. 
-RUN addgroup --system nonroot && adduser --system --ingroup nonroot nonroot
+RUN groupadd -g 10001 nonroot && useradd -u 10001 -g 10001 -s /bin/sh -m nonroot
 
 # Set the working directory.
 WORKDIR /app
