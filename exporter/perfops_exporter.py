@@ -149,20 +149,22 @@ def extract_timestamp(row, col_idx, fallback_ns):
             val = row[col_idx[col]]
             if val is not None:
                 if isinstance(val, (int, float)):
-                    if val > 1e11:  # ms
-                        return int(val * 1e6)
+                    if val > 100000000000:  # ms
+                        return int(val * 1000000) if isinstance(val, int) else int(val * 1000000.0)
                     else:  # s
-                        return int(val * 1e9)
+                        return int(val * 1000000000) if isinstance(val, int) else int(val * 1000000000.0)
                 elif isinstance(val, str):
                     try:
                         # Try parsing as ISO
                         dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
-                        return int(dt.timestamp() * 1e9)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return int(dt.timestamp() * 1000000000)
                     except ValueError:
                         try:
                             # Try YYYY-MM-DD HH:MM:SS
                             dt = datetime.strptime(val, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                            return int(dt.timestamp() * 1e9)
+                            return int(dt.timestamp() * 1000000000)
                         except ValueError:
                             pass
     return fallback_ns
@@ -268,7 +270,16 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
             try:
                 response = requests.get(BASE_URL, headers=HEADERS, params=params, timeout=30)
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get("Retry-After", "5"))
+                    retry_after_str = response.headers.get("Retry-After", "5")
+                    try:
+                        retry_after = int(retry_after_str)
+                    except ValueError:
+                        from email.utils import parsedate_to_datetime
+                        try:
+                            dt = parsedate_to_datetime(retry_after_str)
+                            retry_after = max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+                        except (TypeError, ValueError):
+                            retry_after = 5
                     print(f"Rate limited, retrying after {retry_after}s...")
                     time.sleep(retry_after)
                     retry_count += 1
