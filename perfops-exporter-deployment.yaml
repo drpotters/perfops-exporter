@@ -60,6 +60,8 @@ spec:  # Ensures one replica of the pod is always running.
           value: "perfops"
         - name: INFLUXDB_BUCKET
           value: "perfops-cdn"
+        - name: INFLUX_BATCH_SIZE
+          value: "5000"
         - name: SCRAPE_INTERVAL
           value: "120"
         - name: CHECKPOINT_FILE
@@ -69,21 +71,30 @@ spec:  # Ensures one replica of the pod is always running.
         - name: RETENTION_SAFETY_MINUTES
           value: "5"
         - name: BACKFILL_CHUNK_MINUTES
-          value: "10"
+          value: "2"
         - name: OVERLAP_SECONDS
           value: "60"
         - name: INGEST_LAG_SECONDS
           value: "0"
         - name: BACKFILL_REQUEST_DELAY
-          value: "0.5"
+          value: "0.2"
+        - name: PAGE_LIMIT
+          value: "10000"
         - name: MAX_PAGES_PER_WINDOW
-          value: "500"
+          value: "100"
         - name: GEO_CACHE_FILE
           value: "/data/geo_cache.json"
         - name: GEOCODER_USER_AGENT
           value: "perfops-exporter (your-team@yourcompany.com)"
         - name: PYTHONUNBUFFERED
           value: "1"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
         # NEW: mount the PVC
         volumeMounts:
           - name: exporter-data

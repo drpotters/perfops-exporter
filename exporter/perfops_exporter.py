@@ -26,21 +26,23 @@ INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://localhost:8086")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "perfops")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "perfops-cdn")
+INFLUX_BATCH_SIZE = int(os.environ.get("INFLUX_BATCH_SIZE", "5000"))
 
 # --- Geocoding configuration ---
 GEO_CACHE_FILE = os.environ.get("GEO_CACHE_FILE", "geo_cache.json")
 GEOCODER_USER_AGENT = os.environ.get("GEOCODER_USER_AGENT", "perfops-exporter (ops@example.com)")
 
-# --- Backfill configuration ---
+# --- Backfill & Pagination configuration ---
 CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE", "/data/checkpoint.json")
 MAX_BACKFILL_HOURS = int(os.environ.get("MAX_BACKFILL_HOURS", "48"))
 RETENTION_SAFETY_MINUTES = int(os.environ.get("RETENTION_SAFETY_MINUTES", "5"))
-BACKFILL_CHUNK_MINUTES = int(os.environ.get("BACKFILL_CHUNK_MINUTES", "10"))
+BACKFILL_CHUNK_MINUTES = int(os.environ.get("BACKFILL_CHUNK_MINUTES", "2"))
 OVERLAP_SECONDS = int(os.environ.get("OVERLAP_SECONDS", "60"))
 INGEST_LAG_SECONDS = int(os.environ.get("INGEST_LAG_SECONDS", "0"))
 INITIAL_BACKFILL_HOURS = int(os.environ.get("INITIAL_BACKFILL_HOURS", "0"))
-BACKFILL_REQUEST_DELAY = float(os.environ.get("BACKFILL_REQUEST_DELAY", "0.5"))
-MAX_PAGES_PER_WINDOW = int(os.environ.get("MAX_PAGES_PER_WINDOW", "500"))
+BACKFILL_REQUEST_DELAY = float(os.environ.get("BACKFILL_REQUEST_DELAY", "0.2"))
+PAGE_LIMIT = int(os.environ.get("PAGE_LIMIT", "10000"))
+MAX_PAGES_PER_WINDOW = int(os.environ.get("MAX_PAGES_PER_WINDOW", "100"))
 
 GEO_OVERRIDES = {
     "Ashburn|United States":  [39.0438, -77.4874],
@@ -254,15 +256,20 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
     fallback_ns = int(end_time.timestamp() * 1e9)
     
     page = 1
+    pages_fetched = 0
     total_points = 0
     logged_missing_ts = False
+    prev_page_hash = None
+    min_ts_ns = None
+    max_ts_ns = None
+    hit_max_pages = False
     
     while page <= MAX_PAGES_PER_WINDOW:
         params = {
             "dateTimeFrom": date_from,
             "dateTimeTo": date_to,
             "page": page,
-            "pagelimit": 200
+            "pagelimit": PAGE_LIMIT
         }
         
         retry_count = 0
@@ -308,9 +315,21 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
         if not columns or not values:
             break
 
+        # Detect if the API is ignoring `page` and returning identical rows
+        page_hash = hashlib.md5(json.dumps(values, sort_keys=True).encode()).hexdigest()
+        if page_hash == prev_page_hash:
+            print(f"WARNING: Page {page} returned identical data to page {page - 1}. "
+                  f"API may be ignoring pagination parameters. Stopping early.")
+            break
+        prev_page_hash = page_hash
+
         col_idx = {name: idx for idx, name in enumerate(columns)}
         points = []
         for row in values:
+            row_ts = extract_timestamp(row, col_idx, -1)
+            if row_ts != -1:
+                min_ts_ns = row_ts if min_ts_ns is None else min(min_ts_ns, row_ts)
+                max_ts_ns = row_ts if max_ts_ns is None else max(max_ts_ns, row_ts)
             pt = build_point(row, col_idx, fallback_ns)
             if pt:
                 points.append(pt)
@@ -322,9 +341,12 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
                 
         if points:
             try:
-                # Write in batches of 1000 max (not likely to hit per page, but good practice)
-                write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=points)
+                # Write in batches of INFLUX_BATCH_SIZE (default 5000)
+                for i in range(0, len(points), INFLUX_BATCH_SIZE):
+                    batch = points[i:i + INFLUX_BATCH_SIZE]
+                    write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=batch)
                 total_points += len(points)
+                pages_fetched += 1
             except ApiException as e:
                 print(f"InfluxDB write failed ({e.status}): {e.body}")
                 return False
@@ -332,13 +354,28 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
                 print(f"An unexpected error occurred during InfluxDB write: {e}")
                 return False
 
-        if len(values) < 200:
+        if len(values) < PAGE_LIMIT:
             break
             
-        page += 1
-        time.sleep(BACKFILL_REQUEST_DELAY)
+        if page == MAX_PAGES_PER_WINDOW:
+            hit_max_pages = True
+            break
 
-    print(f"Successfully processed {total_points} points from {date_from} to {date_to} (pages: {page})")
+        page += 1
+        if BACKFILL_REQUEST_DELAY > 0:
+            time.sleep(BACKFILL_REQUEST_DELAY)
+
+    ts_range_info = ""
+    if min_ts_ns and max_ts_ns:
+        min_dt = datetime.fromtimestamp(min_ts_ns / 1e9, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        max_dt = datetime.fromtimestamp(max_ts_ns / 1e9, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        ts_range_info = f" [actual data ts: {min_dt} .. {max_dt}]"
+
+    print(f"Successfully processed {total_points} points from {date_from} to {date_to} "
+          f"(pages: {pages_fetched}){ts_range_info}")
+    if hit_max_pages:
+        print(f"WARNING: Hit MAX_PAGES_PER_WINDOW ({MAX_PAGES_PER_WINDOW}) for {date_from} to {date_to}! "
+              f"Data for this window was truncated.")
     return True
 
 def catch_up(write_api):
@@ -354,8 +391,13 @@ def catch_up(write_api):
         if checkpoint < earliest:
             print(f"WARNING: unrecoverable gap from {checkpoint} to {earliest}. Outage exceeded {MAX_BACKFILL_HOURS} hours.")
             
+    chunk_delta = timedelta(minutes=BACKFILL_CHUNK_MINUTES)
+
     while start < now:
-        end = min(start + timedelta(minutes=BACKFILL_CHUNK_MINUTES), now)
+        end = min(start + chunk_delta, now)
+        if (end - start).total_seconds() < 5:
+            break
+
         success = fetch_window(write_api, start, end)
         if not success:
             print(f"Failed to process chunk from {start} to {end}. Stopping catch-up for this cycle.")
@@ -363,7 +405,10 @@ def catch_up(write_api):
         
         save_checkpoint(end)
         start = end
-        time.sleep(BACKFILL_REQUEST_DELAY)
+        
+        now = datetime.now(timezone.utc) - timedelta(seconds=INGEST_LAG_SECONDS)
+        if start < now and BACKFILL_REQUEST_DELAY > 0:
+            time.sleep(BACKFILL_REQUEST_DELAY)
 
 # --- Main Execution ---
 if __name__ == '__main__':
@@ -384,10 +429,13 @@ if __name__ == '__main__':
     
     try:
         while True:
+            cycle_start = time.time()
             catch_up(write_api)
             if not provider_map or time.time() - providers_loaded_at > PROVIDER_REFRESH:
                 load_providers()
-            print(f"Waiting for {SCRAPE_INTERVAL} seconds before next fetch.")
-            time.sleep(SCRAPE_INTERVAL)
+            elapsed = time.time() - cycle_start
+            sleep_for = max(5, SCRAPE_INTERVAL - elapsed)
+            print(f"Cycle took {elapsed:.1f}s. Waiting for {sleep_for:.1f} seconds before next fetch.")
+            time.sleep(sleep_for)
     finally:
         client.close()
