@@ -294,7 +294,7 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
                 response.raise_for_status()
                 break
             except requests.exceptions.RequestException as e:
-                print(f"Error fetching data from PerfOps API: {e}")
+                print(f"Error fetching data from PerfOps API: {e} | Body: {getattr(e.response, 'text', '')}")
                 retry_count += 1
                 if retry_count >= 3:
                     return False
