@@ -88,6 +88,10 @@ spec:  # Ensures one replica of the pod is always running.
           value: "perfops-exporter (your-team@yourcompany.com)"
         - name: PYTHONUNBUFFERED
           value: "1"
+        # Optional: Filter raw logs to specific CDN providers by name (comma-separated, e.g. "F5,Cloudflare")
+        # Leave empty or omit to fetch data for all CDNs.
+        - name: CDN_FILTER
+          value: "F5"
         resources:
           requests:
             cpu: "100m"

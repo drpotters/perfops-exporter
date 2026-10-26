@@ -43,6 +43,7 @@ INITIAL_BACKFILL_HOURS = int(os.environ.get("INITIAL_BACKFILL_HOURS", "0"))
 BACKFILL_REQUEST_DELAY = float(os.environ.get("BACKFILL_REQUEST_DELAY", "0.2"))
 PAGE_LIMIT = int(os.environ.get("PAGE_LIMIT", "10000"))
 MAX_PAGES_PER_WINDOW = int(os.environ.get("MAX_PAGES_PER_WINDOW", "100"))
+CDN_FILTER = os.environ.get("CDN_FILTER", "").strip()
 
 GEO_OVERRIDES = {
     "Ashburn|United States":  [39.0438, -77.4874],
@@ -108,9 +109,10 @@ def get_city_coords(city, country):
 
 provider_map = {}
 providers_loaded_at = 0.0
+cdn_filter_ids = []
 
 def load_providers():
-    global provider_map, providers_loaded_at
+    global provider_map, providers_loaded_at, cdn_filter_ids
     print("Loading CDN providers...")
     try:
         response = requests.get(PROVIDERS_URL, headers=HEADERS, timeout=30)
@@ -121,6 +123,25 @@ def load_providers():
             provider_map = new_map
             providers_loaded_at = time.time()
         print(f"Loaded {len(provider_map)} CDN providers.")
+        
+        # Resolve CDN_FILTER
+        if CDN_FILTER:
+            name_to_id = {v.lower(): k for k, v in provider_map.items()}
+            new_filter_ids = []
+            for name in CDN_FILTER.split(","):
+                n = name.strip().lower()
+                if n in name_to_id:
+                    new_filter_ids.append(name_to_id[n])
+                elif n:
+                    print(f"WARNING: CDN name '{name.strip()}' not found in provider list. "
+                          f"Available: {sorted(provider_map.values())}")
+            
+            if new_filter_ids:
+                cdn_filter_ids = new_filter_ids
+                print(f"CDN_FILTER active: '{CDN_FILTER}' → IDs: {cdn_filter_ids}")
+            else:
+                cdn_filter_ids = []
+                print(f"ERROR: CDN_FILTER is set to '{CDN_FILTER}' but no matching CDNs found. Falling back to all CDNs.")
     except Exception as e:
         print(f"Warning: Could not load CDN providers list: {e}")
 
@@ -271,7 +292,9 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
             "page": page,
             "pagelimit": PAGE_LIMIT
         }
-        
+        if cdn_filter_ids:
+            params["providers"] = ",".join(cdn_filter_ids)
+            
         retry_count = 0
         while retry_count < 3:
             try:
