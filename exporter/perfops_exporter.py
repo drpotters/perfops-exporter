@@ -1,6 +1,9 @@
+import argparse
+import math
 import requests
 import json
 import os
+import sys
 import time
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -27,6 +30,10 @@ INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "perfops")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "perfops-cdn")
 INFLUX_BATCH_SIZE = int(os.environ.get("INFLUX_BATCH_SIZE", "5000"))
+# Write timeout (the client default is 10s, which is what tripped during the Nov 3-4 overload)
+INFLUX_TIMEOUT_MS = int(os.environ.get("INFLUX_TIMEOUT_MS", "30000"))
+# Retries per batch for transient write errors (timeouts, connection refused, 429/5xx)
+INFLUX_WRITE_RETRIES = int(os.environ.get("INFLUX_WRITE_RETRIES", "5"))
 
 # --- Geocoding configuration ---
 GEO_CACHE_FILE = os.environ.get("GEO_CACHE_FILE", "geo_cache.json")
@@ -44,6 +51,12 @@ BACKFILL_REQUEST_DELAY = float(os.environ.get("BACKFILL_REQUEST_DELAY", "0.2"))
 PAGE_LIMIT = int(os.environ.get("PAGE_LIMIT", "10000"))
 MAX_PAGES_PER_WINDOW = int(os.environ.get("MAX_PAGES_PER_WINDOW", "100"))
 CDN_FILTER = os.environ.get("CDN_FILTER", "").strip()
+# When a window hits MAX_PAGES_PER_WINDOW it is split into smaller windows and
+# re-fetched, down to this size. Below it, the truncation is logged and accepted.
+MIN_SPLIT_SECONDS = int(os.environ.get("MIN_SPLIT_SECONDS", "10"))
+
+# fetch_window() results
+FETCH_OK, FETCH_TRUNCATED, FETCH_FAILED = "ok", "truncated", "failed"
 
 GEO_OVERRIDES = {
     "Ashburn|United States":  [39.0438, -77.4874],
@@ -68,7 +81,7 @@ def load_geo_cache():
 geo_cache = load_geo_cache()
 
 def save_geo_cache():
-    tmp = GEO_CACHE_FILE + ".tmp"
+    tmp = f"{GEO_CACHE_FILE}.{os.getpid()}.tmp"
     os.makedirs(os.path.dirname(os.path.abspath(tmp)), exist_ok=True)
     with open(tmp, "w") as f:
         json.dump(geo_cache, f)
@@ -140,10 +153,32 @@ def load_providers():
                 cdn_filter_ids = new_filter_ids
                 print(f"CDN_FILTER active: '{CDN_FILTER}' → IDs: {cdn_filter_ids}")
             else:
-                cdn_filter_ids = []
-                print(f"ERROR: CDN_FILTER is set to '{CDN_FILTER}' but no matching CDNs found. Falling back to all CDNs.")
+                # Do NOT fall back to all CDNs: an unfiltered fetch overflows
+                # MAX_PAGES_PER_WINDOW and writes other providers' data.
+                print(f"ERROR: CDN_FILTER is set to '{CDN_FILTER}' but no matching CDNs found. "
+                      f"Fetching is paused until the filter resolves.")
     except Exception as e:
         print(f"Warning: Could not load CDN providers list: {e}")
+
+def filter_ready():
+    """False until the provider list is loaded (otherwise every row is tagged
+    provider_name="CDN_<id>") and, if CDN_FILTER is set, resolved to provider IDs."""
+    return bool(provider_map) and (not CDN_FILTER or bool(cdn_filter_ids))
+
+def ensure_providers(max_attempts=None, wait_seconds=30):
+    """Load providers until CDN_FILTER resolves. max_attempts=None tries once."""
+    attempts = 0
+    while True:
+        if not provider_map or not filter_ready():
+            load_providers()
+        if filter_ready():
+            return True
+        attempts += 1
+        if max_attempts is None or attempts >= max_attempts:
+            return False
+        print(f"CDN_FILTER not resolved yet; retrying in {wait_seconds}s "
+              f"(attempt {attempts}/{max_attempts})...")
+        time.sleep(wait_seconds)
 
 def get_provider_name(cdnid):
     return provider_map.get(str(cdnid), f"CDN_{cdnid}")
@@ -159,7 +194,7 @@ def load_checkpoint():
     return None
 
 def save_checkpoint(end_time: datetime):
-    tmp = CHECKPOINT_FILE + ".tmp"
+    tmp = f"{CHECKPOINT_FILE}.{os.getpid()}.tmp"
     os.makedirs(os.path.dirname(os.path.abspath(tmp)), exist_ok=True)
     with open(tmp, "w") as f:
         json.dump({"last_end_time": end_time.isoformat()}, f)
@@ -271,7 +306,34 @@ def build_point(row, col_idx, fallback_ns):
     point = point.time(ts_ns + offset_ns, WritePrecision.NS)
     return point
 
+def write_with_retry(write_api, batch):
+    """Write one batch, retrying transient errors with exponential backoff.
+    Re-writing the same points is safe: identical series + timestamp overwrite."""
+    for attempt in range(1, INFLUX_WRITE_RETRIES + 1):
+        try:
+            write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=batch)
+            return True
+        except ApiException as e:
+            # 4xx other than 429 means bad data/auth: retrying won't help
+            if e.status and 400 <= e.status < 500 and e.status != 429:
+                print(f"InfluxDB write failed ({e.status}): {e.body}")
+                return False
+            err = f"HTTP {e.status}"
+        except Exception as e:
+            err = str(e)
+        if attempt == INFLUX_WRITE_RETRIES:
+            print(f"InfluxDB write failed after {attempt} attempts: {err}")
+            return False
+        wait = min(60, 5 * 2 ** (attempt - 1))
+        print(f"InfluxDB write error (attempt {attempt}/{INFLUX_WRITE_RETRIES}): {err}. "
+              f"Retrying in {wait}s...")
+        time.sleep(wait)
+    return False
+
 def fetch_window(write_api, start_time: datetime, end_time: datetime):
+    """Fetch one window and write it. Returns (status, info):
+    FETCH_OK, FETCH_FAILED, or FETCH_TRUNCATED with info = (rows, min_ts_ns, max_ts_ns)
+    describing what was covered before MAX_PAGES_PER_WINDOW was reached."""
     date_from = start_time.strftime('%Y-%m-%d %H:%M:%S')
     date_to = end_time.strftime('%Y-%m-%d %H:%M:%S')
     fallback_ns = int(end_time.timestamp() * 1e9)
@@ -320,11 +382,11 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
                 print(f"Error fetching data from PerfOps API: {e} | Body: {getattr(e.response, 'text', '')}")
                 retry_count += 1
                 if retry_count >= 3:
-                    return False
+                    return FETCH_FAILED, None
                 time.sleep(2 ** retry_count)
                 
         if retry_count >= 3:
-            return False
+            return FETCH_FAILED, None
 
         body = response.json()
         result_array = body.get('result', [])
@@ -363,19 +425,13 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
                 logged_missing_ts = True
                 
         if points:
-            try:
-                # Write in batches of INFLUX_BATCH_SIZE (default 5000)
-                for i in range(0, len(points), INFLUX_BATCH_SIZE):
-                    batch = points[i:i + INFLUX_BATCH_SIZE]
-                    write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=batch)
-                total_points += len(points)
-                pages_fetched += 1
-            except ApiException as e:
-                print(f"InfluxDB write failed ({e.status}): {e.body}")
-                return False
-            except Exception as e:
-                print(f"An unexpected error occurred during InfluxDB write: {e}")
-                return False
+            # Write in batches of INFLUX_BATCH_SIZE (default 5000)
+            for i in range(0, len(points), INFLUX_BATCH_SIZE):
+                batch = points[i:i + INFLUX_BATCH_SIZE]
+                if not write_with_retry(write_api, batch):
+                    return FETCH_FAILED, None
+            total_points += len(points)
+            pages_fetched += 1
 
         if len(values) < PAGE_LIMIT:
             break
@@ -399,9 +455,49 @@ def fetch_window(write_api, start_time: datetime, end_time: datetime):
     if hit_max_pages:
         print(f"WARNING: Hit MAX_PAGES_PER_WINDOW ({MAX_PAGES_PER_WINDOW}) for {date_from} to {date_to}! "
               f"Data for this window was truncated.")
+        return FETCH_TRUNCATED, (total_points, min_ts_ns, max_ts_ns)
+    return FETCH_OK, None
+
+def fetch_range(write_api, start_time: datetime, end_time: datetime):
+    """Fetch [start_time, end_time); if the API page cap truncates it, split the
+    window into smaller ones and fetch those, so no rows are dropped.
+    Returns True on success, False on failure."""
+    status, info = fetch_window(write_api, start_time, end_time)
+    if status == FETCH_OK:
+        return True
+    if status == FETCH_FAILED:
+        return False
+
+    span = (end_time - start_time).total_seconds()
+    if span < 2 * MIN_SPLIT_SECONDS:
+        print(f"WARNING: window {start_time} to {end_time} is still truncated at the minimum split size "
+              f"({MIN_SPLIT_SECONDS}s); accepting partial data. Consider raising PAGE_LIMIT/MAX_PAGES_PER_WINDOW.")
+        return True
+
+    # Estimate how many sub-windows are needed from the density of what we got
+    # (target 70% of the page cap per sub-window). Fall back to halving.
+    rows, min_ts, max_ts = info
+    parts = 2
+    if rows and min_ts and max_ts and max_ts > min_ts:
+        rate = rows / ((max_ts - min_ts) / 1e9)                 # rows per second
+        capacity = PAGE_LIMIT * MAX_PAGES_PER_WINDOW * 0.7
+        parts = max(2, math.ceil(rate * span / capacity))
+    parts = min(parts, int(span // MIN_SPLIT_SECONDS))
+    step = math.ceil(span / parts)                              # whole seconds (API resolution)
+    print(f"Splitting {start_time} to {end_time} into {parts} sub-windows of ~{step}s to recover truncated rows.")
+
+    sub_start = start_time
+    while sub_start < end_time:
+        sub_end = min(sub_start + timedelta(seconds=step), end_time)
+        if not fetch_range(write_api, sub_start, sub_end):
+            return False
+        sub_start = sub_end
     return True
 
 def catch_up(write_api):
+    if not filter_ready():
+        print(f"Skipping fetch: provider list not loaded / CDN_FILTER '{CDN_FILTER}' not resolved yet.")
+        return
     now = datetime.now(timezone.utc) - timedelta(seconds=INGEST_LAG_SECONDS)
     earliest = now - timedelta(hours=MAX_BACKFILL_HOURS) + timedelta(minutes=RETENTION_SAFETY_MINUTES)
     
@@ -421,7 +517,7 @@ def catch_up(write_api):
         if (end - start).total_seconds() < 5:
             break
 
-        success = fetch_window(write_api, start, end)
+        success = fetch_range(write_api, start, end)
         if not success:
             print(f"Failed to process chunk from {start} to {end}. Stopping catch-up for this cycle.")
             break
@@ -433,8 +529,51 @@ def catch_up(write_api):
         if start < now and BACKFILL_REQUEST_DELAY > 0:
             time.sleep(BACKFILL_REQUEST_DELAY)
 
+def parse_utc(value: str) -> datetime:
+    """Accepts '2026-11-03T16:59:37Z', '2026-11-03 16:59:37' etc. Naive values are UTC."""
+    dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+def refetch(write_api, start: datetime, end: datetime, max_window_retries=5):
+    """One-shot re-fetch of [start, end). Never reads or writes the checkpoint, so it
+    can run alongside the live exporter. Safe to repeat: rows get the same timestamp
+    (row-hash offset) and overwrite instead of duplicating."""
+    chunk = timedelta(minutes=BACKFILL_CHUNK_MINUTES)
+    total_windows = math.ceil((end - start) / chunk)
+    done = 0
+    t0 = time.time()
+    cur = start
+    while cur < end:
+        nxt = min(cur + chunk, end)
+        for attempt in range(1, max_window_retries + 1):
+            if fetch_range(write_api, cur, nxt):
+                break
+            wait = min(300, 30 * attempt)
+            print(f"Window {cur} to {nxt} failed (attempt {attempt}/{max_window_retries}); retrying in {wait}s")
+            time.sleep(wait)
+        else:
+            print(f"ERROR: giving up at {cur}. Resume with:\n"
+                  f"  python perfops_exporter.py --refetch-start '{cur.isoformat()}' --refetch-end '{end.isoformat()}'")
+            return False
+        done += 1
+        if done % 30 == 0 or nxt >= end:
+            rate = (nxt - start).total_seconds() / max(1.0, time.time() - t0)
+            print(f"[refetch] {done}/{total_windows} windows done, now at {nxt} ({rate:.1f}x real time)")
+        cur = nxt
+        if cur < end and BACKFILL_REQUEST_DELAY > 0:
+            time.sleep(BACKFILL_REQUEST_DELAY)
+    print(f"[refetch] complete: {start} to {end}")
+    return True
+
 # --- Main Execution ---
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="PerfOps CDN raw logs -> InfluxDB exporter")
+    parser.add_argument("--refetch-start", help="One-shot mode: re-fetch from this UTC time (e.g. 2026-11-03T16:50:00Z), then exit")
+    parser.add_argument("--refetch-end", help="One-shot mode: re-fetch up to this UTC time (exclusive)")
+    args = parser.parse_args()
+    if bool(args.refetch_start) != bool(args.refetch_end):
+        parser.error("--refetch-start and --refetch-end must be used together")
+
     if not API_KEY:
         print("Error: PERFOPS_API_KEY environment variable not set. Exiting.")
         exit(1)
@@ -444,18 +583,37 @@ if __name__ == '__main__':
         exit(1)
 
     # Initialize InfluxDB Client
-    client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+    client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG,
+                            timeout=INFLUX_TIMEOUT_MS)
     write_api = client.write_api(write_options=SYNCHRONOUS)
 
-    load_providers()
+    if args.refetch_start:
+        start, end = parse_utc(args.refetch_start), parse_utc(args.refetch_end)
+        if end <= start:
+            parser.error("--refetch-end must be after --refetch-start")
+        if not ensure_providers(max_attempts=10):
+            print(f"ERROR: provider list / CDN_FILTER '{CDN_FILTER}' could not be loaded; refusing to re-fetch. Exiting.")
+            client.close()
+            sys.exit(1)
+        print(f"Re-fetching {start} to {end} into {INFLUXDB_URL} / bucket: {INFLUXDB_BUCKET} "
+              f"(providers: {cdn_filter_ids or 'all'}). Checkpoint is not touched.")
+        try:
+            ok = refetch(write_api, start, end)
+        finally:
+            client.close()
+        sys.exit(0 if ok else 1)
+
+    ensure_providers()
     print(f"Starting PerfOps to InfluxDB exporter. Writing to {INFLUXDB_URL} / bucket: {INFLUXDB_BUCKET}")
     
     try:
         while True:
             cycle_start = time.time()
-            catch_up(write_api)
-            if not provider_map or time.time() - providers_loaded_at > PROVIDER_REFRESH:
+            # Reload when the list is missing/stale, or the CDN filter hasn't resolved yet
+            if (not provider_map or not filter_ready()
+                    or time.time() - providers_loaded_at > PROVIDER_REFRESH):
                 load_providers()
+            catch_up(write_api)
             elapsed = time.time() - cycle_start
             sleep_for = max(5, SCRAPE_INTERVAL - elapsed)
             print(f"Cycle took {elapsed:.1f}s. Waiting for {sleep_for:.1f} seconds before next fetch.")
