@@ -51,6 +51,27 @@ BACKFILL_REQUEST_DELAY = float(os.environ.get("BACKFILL_REQUEST_DELAY", "0.2"))
 PAGE_LIMIT = int(os.environ.get("PAGE_LIMIT", "10000"))
 MAX_PAGES_PER_WINDOW = int(os.environ.get("MAX_PAGES_PER_WINDOW", "100"))
 CDN_FILTER = os.environ.get("CDN_FILTER", "").strip()
+# Network diagnosis data (added 2026-11-09), from the raw-logs asn / isp / state / clientDns /
+# reqSeqNumber columns. NETWORK_TAGS=on (default) or off (original schema).
+#   tags   : asn, isp, state, resolver_class (isp/public/other/none/unknown),
+#            resolver_remote (yes/no/anycast/unknown)
+#            asn/isp/state are (nearly) determined by city, so they add few series;
+#            resolver_class/resolver_remote have at most 5 and 4 values.
+#   fields : as_name, resolver_asn, resolver_country, resolver_as_name, resolver_km,
+#            resolver_count, req_seq   (fields, NOT tags: they would multiply raw-bucket series)
+# See network-diag-runbook.md for the cardinality check after deploy.
+NETWORK_TAGS = os.environ.get("NETWORK_TAGS", "on").strip().lower()
+if NETWORK_TAGS not in ("on", "off"):
+    print(f"WARNING: NETWORK_TAGS='{NETWORK_TAGS}' is not on/off; using 'on'.")
+    NETWORK_TAGS = "on"
+
+# Resolver ASNs counted as public DNS services (resolver_class="public")
+PUBLIC_RESOLVER_ASNS = {
+    15169: "Google", 13335: "Cloudflare", 19281: "Quad9", 36692: "Cisco OpenDNS",
+    30607: "Cisco OpenDNS", 212772: "AdGuard", 34939: "NextDNS", 13238: "Yandex",
+    23393: "Neustar UltraDNS public", 42: "PCH (Quad9)", 3356: "Level 3",
+}
+
 # When a window hits MAX_PAGES_PER_WINDOW it is split into smaller windows and
 # re-fetched, down to this size. Below it, the truncation is logged and accepted.
 MIN_SPLIT_SECONDS = int(os.environ.get("MIN_SPLIT_SECONDS", "10"))
@@ -227,6 +248,148 @@ def extract_timestamp(row, col_idx, fallback_ns):
                             pass
     return fallback_ns
 
+# --- Network diagnosis helpers ---------------------------------------------------------
+_RESOLVER_KEYS = ["ip", "asn", "asnName", "country", "continent", "city", "state",
+                  "latitude", "longitude"]          # list order in the raw-logs example
+
+def _num(v):
+    """int/float/numeric string -> float, else None"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+def _clean_tag(v, maxlen=64):
+    """Tag-safe string: never empty, no newlines, bounded length."""
+    if v is None:
+        return "unknown"
+    s = " ".join(str(v).split())[:maxlen]
+    return s if s and s not in ("?", "None", "null") else "unknown"
+
+def _asn_number(v):
+    """asn can be {"number": 7922, "name": "..."} or a bare number/string"""
+    if isinstance(v, dict):
+        v = v.get("number")
+    n = _num(v)
+    return int(n) if n is not None and n > 0 else None
+
+def parse_resolvers(raw):
+    """clientDns -> list of dicts. Accepts a list of dicts (keys as in the API docs) or a list
+    of lists in the documented order: ip, asn, asnName, country, continent, city, state, lat, lon."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    out = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            d = dict(item)
+            if "lat" in d and "latitude" not in d:
+                d["latitude"] = d.get("lat")
+            if "lon" in d and "longitude" not in d:
+                d["longitude"] = d.get("lon")
+        elif isinstance(item, (list, tuple)):
+            d = dict(zip(_RESOLVER_KEYS, item))
+        else:
+            continue
+        out.append(d)
+    return out
+
+def _is_local_ip(ip):
+    ip = str(ip or "")
+    return (ip.startswith("127.") or ip == "::1" or ip.startswith("10.") or
+            ip.startswith("192.168.") or ip.startswith("169.254.") or
+            any(ip.startswith(f"172.{i}.") for i in range(16, 32)))
+
+def pick_resolver(resolvers):
+    """The resolver that faced the internet: first entry with a non-local IP and an ASN,
+    else the first entry with an ASN, else the first entry."""
+    for r in resolvers:
+        if not _is_local_ip(r.get("ip")) and _asn_number(r.get("asn")):
+            return r
+    for r in resolvers:
+        if _asn_number(r.get("asn")):
+            return r
+    return resolvers[0] if resolvers else None
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
+
+def add_network_info(point, get_val, country, coords):
+    """Adds the network-diagnosis tags/fields (see NETWORK_TAGS) to a point."""
+    if NETWORK_TAGS == "off":
+        return point
+
+    asn_raw = get_val('asn')
+    asn = _asn_number(asn_raw)
+    as_name = asn_raw.get("name") if isinstance(asn_raw, dict) else None
+    point = point.tag("asn", str(asn) if asn else "unknown") \
+                 .tag("isp", _clean_tag(get_val('isp')))
+    if as_name:
+        point = point.field("as_name", str(as_name)[:128])
+
+    resolvers = parse_resolvers(get_val('clientDns'))
+    res = pick_resolver(resolvers)
+    res_asn = _asn_number(res.get("asn")) if res else None
+    res_country = _clean_tag(res.get("country")) if res else "unknown"
+
+    # Public resolvers (Google, Cloudflare, ...) are anycast: the location the API reports for
+    # them (e.g. 8.8.8.8 -> Mountain View) is not where the query was answered, so distance
+    # and "remote" are meaningless for them.
+    if not res:
+        res_class = "none"
+    elif res_asn and asn and res_asn == asn:
+        res_class = "isp"                     # the probe's own ISP resolver
+    elif res_asn in PUBLIC_RESOLVER_ASNS:
+        res_class = "public"                  # Google, Cloudflare, Quad9, ...
+    elif res_asn:
+        res_class = "other"                   # a third-party / corporate resolver
+    else:
+        res_class = "unknown"
+
+    if res_class == "public":
+        res_remote = "anycast"
+    elif res_country == "unknown" or country in ("unknown", "", "None"):
+        res_remote = "unknown"
+    else:
+        res_remote = "no" if res_country == country else "yes"
+
+    point = point.tag("state", _clean_tag(get_val('state'))) \
+                 .tag("resolver_class", res_class) \
+                 .tag("resolver_remote", res_remote)
+
+    point = point.field("resolver_count", float(len(resolvers)))
+    if res:
+        if res_asn:
+            point = point.field("resolver_asn", str(res_asn))
+        if res_country != "unknown":
+            point = point.field("resolver_country", res_country)
+        name = res.get("asnName")
+        if name:
+            point = point.field("resolver_as_name", str(name)[:128])
+        rlat, rlon = _num(res.get("latitude")), _num(res.get("longitude"))
+        if (res_class != "public" and coords and rlat is not None and rlon is not None
+                and not (rlat == 0 and rlon == 0)):
+            point = point.field("resolver_km",
+                                round(haversine_km(coords[0], coords[1], rlat, rlon), 1))
+
+    seq = _num(get_val('reqSeqNumber'))
+    if seq is not None:
+        point = point.field("req_seq", seq)
+    return point
+
 def build_point(row, col_idx, fallback_ns):
     def get_val(col_name, default=None):
         if col_name in col_idx:
@@ -247,7 +410,8 @@ def build_point(row, col_idx, fallback_ns):
     http_version = str(get_val('httpVersion', 'unknown'))
     
     cache = get_val('cache')
-    cache_status = 'hit' if cache == 1 else 'miss' if cache == 0 else str(cache)
+    # The API documents cache values 1 (hit) and -1 (miss); 0 is also treated as a miss.
+    cache_status = 'hit' if cache == 1 else 'miss' if cache in (0, -1) else str(cache)
     status_code = str(get_val('statusCode', 'unknown'))
     failure_reason = str(get_val('failureReason', 'NONE'))
 
@@ -295,6 +459,8 @@ def build_point(row, col_idx, fallback_ns):
 
     if coords:
         point = point.field("lat", float(coords[0])).field("lon", float(coords[1]))
+
+    point = add_network_info(point, get_val, country, coords)
 
     ts_ns = extract_timestamp(row, col_idx, fallback_ns)
     
@@ -604,7 +770,8 @@ if __name__ == '__main__':
         sys.exit(0 if ok else 1)
 
     ensure_providers()
-    print(f"Starting PerfOps to InfluxDB exporter. Writing to {INFLUXDB_URL} / bucket: {INFLUXDB_BUCKET}")
+    print(f"Starting PerfOps to InfluxDB exporter. Writing to {INFLUXDB_URL} / bucket: {INFLUXDB_BUCKET} "
+          f"(NETWORK_TAGS={NETWORK_TAGS})")
     
     try:
         while True:
