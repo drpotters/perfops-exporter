@@ -1,4 +1,20 @@
 # perfops-exporter.yaml
+# --- PERSISTENT VOLUME CLAIM ---                                    # NEW
+# Stores the geocoding cache (geo_cache.json) across pod restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: perfops-exporter-data
+  labels:
+    app: perfops-exporter
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName: standard   # uncomment/set if your cluster has no default StorageClass
+  resources:
+    requests:
+      storage: 100Mi              # the cache is only KBs; this is plenty
+---
 # --- DEPLOYMENT ---
 # Manages the lifecycle of the perfops-exporter pod. 
 apiVersion: apps/v1
@@ -8,47 +24,88 @@ metadata:
   labels:
     app: perfops-exporter
 spec:  # Ensures one replica of the pod is always running. 
-  replicas: 1  # Links the Deployment to the pods it manages via labels. 
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: perfops-exporter  # Blueprint for the pods created by this Deployment. 
   template:
     metadata:
       labels:
-        app: perfops-exporter      # Annotations for automatic discovery by Prometheus. 
-      annotations:
-        prometheus.io/scrape: 'true'
-        prometheus.io/path: '/metrics' # The endpoint for metrics.
-        prometheus.io/port: '8000'    # The port to scrape. 
+        app: perfops-exporter
     spec:
+      securityContext:
+        fsGroup: 10001
       containers:
       - name: perfops-exporter-container
-        # IMPORTANT: Replace with your actual image path from your registry.
-        image: your-repo/perfops-exporter:latest
+        # Image built and pushed by the GitHub Actions workflow
+        # (.github/workflows/docker-build.yml).
+        image: ghcr.io/drpotters/perfops-exporter:latest
         imagePullPolicy: Always
-        ports:
-        - containerPort: 8000
-          name: http-metrics        # Securely inject the API key from a Kubernetes Secret. 
+        # Securely inject the API keys and configurations from a Kubernetes Secret/ConfigMap. 
         env:
         - name: PERFOPS_API_KEY
-          valueFrom:            # Source the value from a Secret. 
-            secretKeyRef:              # The name of the Secret object. 
-              name: perfops-secret              # The key within the Secret to use. 
+          valueFrom:
+            secretKeyRef:
+              name: perfops-secret
               key: PERFOPS_API_KEY
----
-# --- SERVICE ---
-# Provides a stable network endpoint for the exporter pod. 
-apiVersion: v1
-kind: Service
-metadata:
-  name: perfops-exporter-service
-  labels:
-    app: perfops-exporter
-spec:  # Routes traffic to pods with this label. 
-  selector:
-    app: perfops-exporter
-  ports:
-  - protocol: TCP
-    # The port the Service exposes within the cluster.
-    port: 8000    # The port on the target pod to forward traffic to. 
-    targetPort: http-metrics
+        - name: INFLUXDB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: perfops-secret
+              key: INFLUXDB_TOKEN
+        - name: INFLUXDB_URL
+          value: "http://influxdb.monitoring.svc.cluster.local:8086"
+        - name: INFLUXDB_ORG
+          value: "perfops"
+        - name: INFLUXDB_BUCKET
+          value: "perfops-cdn"
+        - name: INFLUX_BATCH_SIZE
+          value: "5000"
+        - name: SCRAPE_INTERVAL
+          value: "120"
+        - name: CHECKPOINT_FILE
+          value: "/data/checkpoint.json"
+        - name: MAX_BACKFILL_HOURS
+          value: "48"
+        - name: RETENTION_SAFETY_MINUTES
+          value: "5"
+        - name: BACKFILL_CHUNK_MINUTES
+          value: "2"
+        - name: OVERLAP_SECONDS
+          value: "60"
+        - name: INGEST_LAG_SECONDS
+          value: "0"
+        - name: BACKFILL_REQUEST_DELAY
+          value: "0.2"
+        - name: PAGE_LIMIT
+          value: "10000"
+        - name: MAX_PAGES_PER_WINDOW
+          value: "100"
+        - name: GEO_CACHE_FILE
+          value: "/data/geo_cache.json"
+        - name: GEOCODER_USER_AGENT
+          value: "perfops-exporter (your-team@yourcompany.com)"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        # Optional: Filter raw logs to specific CDN providers by name (comma-separated, e.g. "F5,Cloudflare")
+        # Leave empty or omit to fetch data for all CDNs.
+        - name: CDN_FILTER
+          value: ""
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        # NEW: mount the PVC
+        volumeMounts:
+          - name: exporter-data
+            mountPath: /data
+      # NEW: link the PVC to the pod
+      volumes:
+        - name: exporter-data
+          persistentVolumeClaim:
+            claimName: perfops-exporter-data
