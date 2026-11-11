@@ -39,8 +39,9 @@ spec:  # Ensures one replica of the pod is always running.
         fsGroup: 10001
       containers:
       - name: perfops-exporter-container
-        # IMPORTANT: Replace with your actual image path from your registry.
-        image: your-repo/perfops-exporter:latest
+        # Image built and pushed by the GitHub Actions workflow
+        # (.github/workflows/docker-build.yml).
+        image: ghcr.io/drpotters/perfops-exporter:latest
         imagePullPolicy: Always
         # Securely inject the API keys and configurations from a Kubernetes Secret/ConfigMap. 
         env:

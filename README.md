@@ -115,17 +115,62 @@ A deployment manifest is provided for deploying the exporter to a Kubernetes clu
    ```
 
 2. **Update the Deployment Configuration:**
-   Edit the `perfops-exporter-deployment.yaml` file to replace `your-repo/perfops-exporter:latest` with the actual path to your container registry. Update the `INFLUXDB_URL` pointing to your InfluxDB service.
+   Edit the `perfops-exporter-deployment.yaml` file to replace `ghcr.io/drpotters/perfops-exporter:latest` with the actual path to your container registry. Update the `INFLUXDB_URL` pointing to your InfluxDB service.
 
 3. **Apply the deployment:**
    ```bash
    kubectl apply -f perfops-exporter-deployment.yaml
    ```
 
+## CI/CD Pipeline
+
+The repository includes a GitHub Actions workflow (`.github/workflows/docker-build.yml`) that builds the Docker image and pushes it to the **GitHub Container Registry** (`ghcr.io`) whenever the exporter changes.
+
+**Triggers:** the workflow runs on pushes to any branch, on version tags (`v*.*.*`), and on pull requests, but only when files under `exporter/` (or the workflow file itself) are modified. Unrelated changes do not produce a new image. It can also be started manually via `workflow_dispatch`.
+
+**Authentication:** no repository secrets are required. The workflow uses the built-in `GITHUB_TOKEN` with `packages: write` permission.
+
+**Published tags:**
+
+| Tag | Description |
+| --- | --- |
+| `ghcr.io/drpotters/perfops-exporter:v1.2.3` | Immutable version tag — one per build. |
+| `ghcr.io/drpotters/perfops-exporter:sha-<commit-sha>` | Immutable tag for the exact commit. |
+| `ghcr.io/drpotters/perfops-exporter:<branch>` | Moving tag tracking the branch. |
+| `ghcr.io/drpotters/perfops-exporter:latest` | Newest build from the default branch. |
+
+Pull requests build the image to validate the Dockerfile but do not push it.
+
+### Versioning
+
+Every build produces a new immutable version tag, so if `latest` misbehaves you can pin a deployment to a known-good version instead of rolling back the code.
+
+**Releasing a specific version (preferred):** push a git tag and that exact version is built and published.
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+**Automatic versioning:** a build on the default branch with no git tag automatically gets the next patch version, derived from the highest existing `vX.Y.Z` tag (for example `v1.2.0` → `v1.2.1`). The first ever build is `v0.0.1`. The counter lives in git tags, so no extra state or secrets are needed.
+
+`latest` only moves for builds from the default branch, so feature-branch builds never overwrite it.
+
+**Pinning a deployment to a version:** replace `latest` in `perfops-exporter-deployment.yaml` with the version you want.
+
+```yaml
+image: ghcr.io/drpotters/perfops-exporter:v1.2.0
+```
+
+> **Note:** the package is private by default. To pull it from a Kubernetes cluster, either make the package public in the repository's package settings or create an image pull secret.
+
 ## Project Structure
 
 ```text
 perfops-exporter/
+├── .github/
+│   └── workflows/
+│       └── docker-build.yml   # CI: build & push the image to ghcr.io
 ├── exporter/
 │   ├── Dockerfile             # Multi-stage lightweight Dockerfile
 │   ├── perfops_exporter.py    # Main exporter script

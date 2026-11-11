@@ -1,0 +1,166 @@
+# GitHub Actions workflow for the PerfOps Exporter.
+#
+# Builds the Docker image from exporter/Dockerfile and pushes it to the
+# GitHub Container Registry (ghcr.io) whenever the exporter changes.
+#
+# Versioning
+# ----------
+# Every build produces a new, immutable version tag so a specific build can
+# always be pulled later if `latest` misbehaves. Two schemes are supported:
+#
+#   1. Tag-driven (preferred): push a git tag like `v1.2.0` and that exact
+#      version is built and published.
+#   2. Auto-increment: a build on the default branch with no git tag gets the
+#      next patch version derived from the highest existing `vX.Y.Z` tag
+#      (e.g. v1.2.0 -> v1.2.1). The counter lives in git tags, so no extra
+#      state or secrets are needed.
+#
+# `latest` always points at the newest build from the default branch.
+#
+# Authentication uses the built-in GITHUB_TOKEN, so no extra secrets are
+# required. The workflow only needs `packages: write` permission.
+
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*.*.*"
+    paths:
+      - "exporter/**"
+      - ".github/workflows/docker-build.yml"
+  pull_request:
+    paths:
+      - "exporter/**"
+      - ".github/workflows/docker-build.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Work out which version this build represents before building anything.
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_release: ${{ steps.version.outputs.is_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history and tags are required to find the highest version.
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # A pushed git tag (v1.2.0) is an explicit release: use it verbatim.
+          if [ "$REF_TYPE" = "tag" ]; then
+            VERSION="$REF_NAME"
+            echo "Using pushed tag: $VERSION"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Pull requests only validate the build; the version is a placeholder.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "version=pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Otherwise auto-increment the patch of the highest existing vX.Y.Z tag.
+          HIGHEST="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+          if [ -z "$HIGHEST" ]; then
+            HIGHEST="v0.0.0"
+          fi
+          echo "Highest existing version tag: $HIGHEST"
+
+          BASE="${HIGHEST#v}"
+          MAJOR="${BASE%%.*}"
+          REST="${BASE#*.}"
+          MINOR="${REST%%.*}"
+          PATCH="${REST#*.}"
+          VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "Auto-incremented version: $VERSION"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Only the default branch publishes `latest`.
+          if [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Pull requests from forks cannot push to the registry, so only log in
+      # for events that are allowed to publish.
+      - name: Log in to the Container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.resolve-version.outputs.version }}
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=latest,enable=${{ needs.resolve-version.outputs.is_release == 'true' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: exporter
+          file: exporter/Dockerfile
+          # Build on PRs to validate the Dockerfile, but only push elsewhere.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published image"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`${{ needs.resolve-version.outputs.version }}\` |"
+            echo "| Latest moved | \`${{ needs.resolve-version.outputs.is_release }}\` |"
+            echo "| Pushed | \`${{ github.event_name != 'pull_request' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
