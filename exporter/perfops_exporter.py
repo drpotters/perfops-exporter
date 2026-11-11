@@ -72,6 +72,38 @@ PUBLIC_RESOLVER_ASNS = {
     23393: "Neustar UltraDNS public", 42: "PCH (Quad9)", 3356: "Level 3",
 }
 
+# --- CDN comparison collector (added 2026-11-11) ---------------------------------------
+# Hourly per-CDN aggregates from /analytics/cdn/data (PerfOps' own pre-aggregated stats,
+# no raw logs), written to COMPARE_BUCKET as measurement perfops_cdn_compare:
+#   tags   provider_name, country (name, or "_all"), asn (number, or "_all")
+#   fields mean_ms, median_ms, p95_ms   request time (ms = ttfb + transfer; excludes setup)
+#          tcp_ms, tls_ms      connection setup AVERAGED OVER ALL REQUESTS (reused
+#                              connections count as 0); tcp includes TLS.
+#                              mean_ms + tcp_ms = mean time per request incl. setup (no DNS)
+#                              tls / (tcp - tls) = TLS round trips per TCP round trip.
+#          ttfb_ms, uptime     (country / global rows only)
+# Verified 2026-11-11 against raw logs (F5, AS7922, one hour): API median 27 = median(ms) 27,
+# mean 37.0 ~ 37.7, ttfb 35.5 ~ 35.6, tcptime 31.2 ~ sum(tcp)/all requests 33.4.
+# Three levels per hour: country x ASN (per CDN, limited to the anchor CDN's country x ASN
+# pairs), country (all CDNs, one call) and global (one call). ~8 API calls per hour.
+COMPARE = os.environ.get("COMPARE", "off").strip().lower() == "on"
+COMPARE_CDNS = os.environ.get("COMPARE_CDNS",
+    "F5 CDN,Akamai CDN,Cloudflare CDN,Fastly CDN,AWS CloudFront CDN,Google Cloud CDN").strip()
+COMPARE_ANCHOR = os.environ.get("COMPARE_ANCHOR", "F5 CDN").strip()
+# ASN-level rows only for these countries (names or ISO codes, comma-separated; empty = all)
+COMPARE_COUNTRIES = os.environ.get("COMPARE_COUNTRIES", "").strip()
+COMPARE_BUCKET = os.environ.get("COMPARE_BUCKET", "perfops-cdn-1h")
+COMPARE_LAG_MINUTES = int(os.environ.get("COMPARE_LAG_MINUTES", "30"))
+COMPARE_INITIAL_HOURS = int(os.environ.get("COMPARE_INITIAL_HOURS", "24"))
+COMPARE_MAX_HOURS_PER_CYCLE = int(os.environ.get("COMPARE_MAX_HOURS_PER_CYCLE", "3"))
+COMPARE_CHECKPOINT_FILE = os.environ.get("COMPARE_CHECKPOINT_FILE", "/data/compare_checkpoint.json")
+DATA_URL = "https://api.perfops.net/analytics/cdn/data"
+COUNTRIES_URL = "https://api.perfops.net/analytics/cdn/countries"
+COMPARE_FUNCS = {"MEAN": "mean_ms", "MEDIAN": "median_ms", "PERCENTILE_95": "p95_ms", "TCPTIME": "tcp_ms",
+                 "TLSTIME": "tls_ms", "TTFB": "ttfb_ms", "UPTIME": "uptime"}
+COMPARE_ASN_FUNCS = "mean,median,percentile_95,tcptime,tlstime"
+COMPARE_AGG_FUNCS = "mean,median,percentile_95,tcptime,tlstime,ttfb,uptime"
+
 # When a window hits MAX_PAGES_PER_WINDOW it is split into smaller windows and
 # re-fetched, down to this size. Below it, the truncation is logged and accepted.
 MIN_SPLIT_SECONDS = int(os.environ.get("MIN_SPLIT_SECONDS", "10"))
@@ -731,14 +763,213 @@ def refetch(write_api, start: datetime, end: datetime, max_window_retries=5):
     print(f"[refetch] complete: {start} to {end}")
     return True
 
+# --- CDN comparison collector ------------------------------------------------------------
+compare_countries = {}          # PerfOps country id (str) -> name
+compare_country_ids = []        # COMPARE_COUNTRIES resolved to ids
+
+def api_get(url, params, timeout=120, attempts=4):
+    """GET with retry on 429 / 5xx / network errors. Returns parsed JSON or None."""
+    for attempt in range(1, attempts + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
+            if r.status_code == 429 or r.status_code >= 500:
+                wait = int(r.headers.get("Retry-After", "0") or 0) or min(120, 10 * attempt)
+                print(f"[compare] HTTP {r.status_code} from {url}; retry in {wait}s")
+                time.sleep(wait)
+                continue
+            if r.status_code != 200:
+                print(f"[compare] HTTP {r.status_code} from {url}: {r.text[:300]}")
+                return None
+            return r.json()
+        except Exception as e:
+            print(f"[compare] request error ({attempt}/{attempts}): {e}")
+            time.sleep(min(120, 10 * attempt))
+    return None
+
+def load_compare_countries():
+    global compare_countries, compare_country_ids
+    data = api_get(COUNTRIES_URL, {}, timeout=30)
+    if not data:
+        return False
+    compare_countries = {str(c["id"]): c.get("name") or str(c["id"]) for c in data}
+    ids = []
+    if COMPARE_COUNTRIES:
+        by_name = {}
+        for c in data:
+            by_name[str(c.get("name", "")).lower()] = str(c["id"])
+            by_name[str(c.get("iso", "")).lower()] = str(c["id"])
+        for n in COMPARE_COUNTRIES.split(","):
+            cid = by_name.get(n.strip().lower())
+            if cid:
+                ids.append(cid)
+            elif n.strip():
+                print(f"[compare] WARNING: country '{n.strip()}' not found")
+    compare_country_ids = ids
+    return True
+
+def compare_provider_ids():
+    """COMPARE_CDNS names -> PerfOps provider ids (anchor first). Unknown names are skipped."""
+    name_to_id = {v.lower(): k for k, v in provider_map.items()}
+    names = [COMPARE_ANCHOR] + [n.strip() for n in COMPARE_CDNS.split(",")
+                                if n.strip() and n.strip().lower() != COMPARE_ANCHOR.lower()]
+    ids = []
+    for n in names:
+        pid = name_to_id.get(n.lower())
+        if pid:
+            ids.append(pid)
+        else:
+            print(f"[compare] WARNING: CDN '{n}' not in provider list")
+    return ids
+
+def _compare_rows(body):
+    """{(cdnid, country_id|'_all', asn|'_all'): {field: value}} from a /cdn/data response."""
+    out = {}
+    for res in (body or {}).get("result", []):
+        field = COMPARE_FUNCS.get(str(res.get("statFunction", "")).upper())
+        if not field:
+            continue
+        for x in res.get("data", []):
+            y = x.get("y")
+            if y is None or x.get("cdnid") is None:
+                continue
+            key = (str(x["cdnid"]), str(x.get("country", "_all")), str(x.get("asn", "_all")))
+            out.setdefault(key, {})[field] = float(y)
+    return out
+
+def compare_hour(write_api, hour_start):
+    """Collect and write one hour. Returns True on success."""
+    f = '%Y-%m-%d %H:%M:%S'
+    base = {"dateTimeFrom": hour_start.strftime(f),
+            "dateTimeTo": (hour_start + timedelta(hours=1)).strftime(f),
+            "groupByTime": "hour"}
+    if compare_country_ids:
+        base["countries"] = ",".join(compare_country_ids)
+    ids = compare_provider_ids()
+    if not ids or provider_map.get(ids[0], "").lower() != COMPARE_ANCHOR.lower():
+        print(f"[compare] anchor CDN '{COMPARE_ANCHOR}' not resolved; skipping")
+        return False
+
+    rows = {}
+    # 1. country x ASN, one CDN per call; competitors limited to the anchor's pairs
+    anchor_pairs = None
+    for pid in ids:
+        body = api_get(DATA_URL, dict(base, providers=pid, groupBase="country,asn",
+                                      statFunction=COMPARE_ASN_FUNCS))
+        if body is None:
+            return False
+        r = _compare_rows(body)
+        if anchor_pairs is None:
+            anchor_pairs = {(k[1], k[2]) for k in r}
+        else:
+            r = {k: v for k, v in r.items() if (k[1], k[2]) in anchor_pairs}
+        rows.update(r)
+    # 2. per country and 3. global, all CDNs in one call each
+    for gb in ("country", "provider"):
+        body = api_get(DATA_URL, dict(base, providers=",".join(ids), groupBase=gb,
+                                      statFunction=COMPARE_AGG_FUNCS))
+        if body is None:
+            return False
+        rows.update(_compare_rows(body))
+
+    ts = int(hour_start.timestamp() * 1e9)
+    points = []
+    for (cdnid, country, asn), fields in rows.items():
+        p = Point("perfops_cdn_compare") \
+            .tag("provider_name", get_provider_name(cdnid)) \
+            .tag("country", country if country == "_all" else compare_countries.get(country, f"C_{country}")) \
+            .tag("asn", asn) \
+            .time(ts, WritePrecision.NS)
+        for k, v in fields.items():
+            p = p.field(k, v)
+        points.append(p)
+    for i in range(0, len(points), INFLUX_BATCH_SIZE):
+        batch = points[i:i + INFLUX_BATCH_SIZE]
+        ok = False
+        for attempt in range(1, INFLUX_WRITE_RETRIES + 1):
+            try:
+                write_api.write(bucket=COMPARE_BUCKET, org=INFLUXDB_ORG, record=batch)
+                ok = True
+                break
+            except Exception as e:
+                print(f"[compare] write error ({attempt}/{INFLUX_WRITE_RETRIES}): {e}")
+                time.sleep(min(60, 5 * 2 ** (attempt - 1)))
+        if not ok:
+            return False
+    n_asn = sum(1 for k in rows if k[2] != "_all")
+    print(f"[compare] {hour_start:%Y-%m-%d %H:00} UTC: {len(points)} points "
+          f"({n_asn} country x ASN, {len(ids)} CDNs)")
+    return True
+
+def load_compare_checkpoint():
+    try:
+        with open(COMPARE_CHECKPOINT_FILE) as fh:
+            return parse_utc(json.load(fh)["next_hour"])
+    except Exception:
+        return None
+
+def save_compare_checkpoint(next_hour):
+    try:
+        with open(COMPARE_CHECKPOINT_FILE, "w") as fh:
+            json.dump({"next_hour": next_hour.isoformat()}, fh)
+    except Exception as e:
+        print(f"[compare] could not save checkpoint: {e}")
+
+def compare_ready():
+    if not provider_map:
+        return False
+    if not compare_countries and not load_compare_countries():
+        return False
+    return True
+
+def compare_catch_up(write_api):
+    """Collect complete hours (older than COMPARE_LAG_MINUTES), at most
+    COMPARE_MAX_HOURS_PER_CYCLE per cycle so the raw-log fetch is never held up."""
+    if not compare_ready():
+        print("[compare] provider / country list not loaded yet; skipping")
+        return
+    now = datetime.now(timezone.utc)
+    last_complete = (now - timedelta(minutes=COMPARE_LAG_MINUTES)).replace(
+        minute=0, second=0, microsecond=0)            # hours < last_complete are final
+    nxt = load_compare_checkpoint() or last_complete - timedelta(hours=COMPARE_INITIAL_HOURS)
+    done = 0
+    while nxt < last_complete and done < COMPARE_MAX_HOURS_PER_CYCLE:
+        if not compare_hour(write_api, nxt):
+            print(f"[compare] hour {nxt} failed; will retry next cycle")
+            return
+        nxt += timedelta(hours=1)
+        save_compare_checkpoint(nxt)
+        done += 1
+
+def compare_backfill(write_api, start, end):
+    """One-shot: collect every hour in [start, end). Doesn't touch the compare checkpoint."""
+    if not compare_ready():
+        print("[compare] provider / country list could not be loaded")
+        return False
+    h = start.replace(minute=0, second=0, microsecond=0)
+    while h < end:
+        for attempt in range(1, 4):
+            if compare_hour(write_api, h):
+                break
+            time.sleep(30 * attempt)
+        else:
+            print(f"[compare] giving up at {h}. Resume with --compare-start '{h.isoformat()}' "
+                  f"--compare-end '{end.isoformat()}'")
+            return False
+        h += timedelta(hours=1)
+    return True
+
 # --- Main Execution ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="PerfOps CDN raw logs -> InfluxDB exporter")
     parser.add_argument("--refetch-start", help="One-shot mode: re-fetch from this UTC time (e.g. 2026-11-03T16:50:00Z), then exit")
     parser.add_argument("--refetch-end", help="One-shot mode: re-fetch up to this UTC time (exclusive)")
+    parser.add_argument("--compare-start", help="One-shot mode: collect CDN comparison hours from this UTC time, then exit")
+    parser.add_argument("--compare-end", help="One-shot mode: collect CDN comparison hours up to this UTC time (exclusive)")
     args = parser.parse_args()
     if bool(args.refetch_start) != bool(args.refetch_end):
         parser.error("--refetch-start and --refetch-end must be used together")
+    if bool(args.compare_start) != bool(args.compare_end):
+        parser.error("--compare-start and --compare-end must be used together")
 
     if not API_KEY:
         print("Error: PERFOPS_API_KEY environment variable not set. Exiting.")
@@ -752,6 +983,16 @@ if __name__ == '__main__':
     client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG,
                             timeout=INFLUX_TIMEOUT_MS)
     write_api = client.write_api(write_options=SYNCHRONOUS)
+
+    if args.compare_start:
+        start, end = parse_utc(args.compare_start), parse_utc(args.compare_end)
+        ensure_providers(max_attempts=10)
+        print(f"[compare] one-shot {start} to {end} -> {COMPARE_BUCKET} (CDNs: {COMPARE_CDNS})")
+        try:
+            ok = compare_backfill(write_api, start, end)
+        finally:
+            client.close()
+        sys.exit(0 if ok else 1)
 
     if args.refetch_start:
         start, end = parse_utc(args.refetch_start), parse_utc(args.refetch_end)
@@ -771,7 +1012,7 @@ if __name__ == '__main__':
 
     ensure_providers()
     print(f"Starting PerfOps to InfluxDB exporter. Writing to {INFLUXDB_URL} / bucket: {INFLUXDB_BUCKET} "
-          f"(NETWORK_TAGS={NETWORK_TAGS})")
+          f"(NETWORK_TAGS={NETWORK_TAGS}, COMPARE={'on' if COMPARE else 'off'})")
     
     try:
         while True:
@@ -781,6 +1022,11 @@ if __name__ == '__main__':
                     or time.time() - providers_loaded_at > PROVIDER_REFRESH):
                 load_providers()
             catch_up(write_api)
+            if COMPARE:
+                try:
+                    compare_catch_up(write_api)
+                except Exception as e:      # never let the comparison stop the raw-log fetch
+                    print(f"[compare] unexpected error: {e}")
             elapsed = time.time() - cycle_start
             sleep_for = max(5, SCRAPE_INTERVAL - elapsed)
             print(f"Cycle took {elapsed:.1f}s. Waiting for {sleep_for:.1f} seconds before next fetch.")
