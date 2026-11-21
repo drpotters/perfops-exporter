@@ -74,7 +74,8 @@ PUBLIC_RESOLVER_ASNS = {
 
 # --- CDN comparison collector (added 2026-11-11) ---------------------------------------
 # Hourly per-CDN aggregates from /analytics/cdn/data (PerfOps' own pre-aggregated stats,
-# no raw logs), written to COMPARE_BUCKET as measurement perfops_cdn_compare:
+# no raw logs), written to COMPARE_BUCKET as measurement COMPARE_MEASUREMENT (perfops_cdn_cmp;
+# before 2026-11-12 it was perfops_cdn_compare with no volume filter):
 #   tags   provider_name, country (name, or "_all"), asn (number, or "_all")
 #   fields mean_ms, median_ms, p95_ms   request time (ms = ttfb + transfer; excludes setup)
 #          tcp_ms, tls_ms      connection setup AVERAGED OVER ALL REQUESTS (reused
@@ -96,7 +97,21 @@ COMPARE_BUCKET = os.environ.get("COMPARE_BUCKET", "perfops-cdn-1h")
 COMPARE_LAG_MINUTES = int(os.environ.get("COMPARE_LAG_MINUTES", "30"))
 COMPARE_INITIAL_HOURS = int(os.environ.get("COMPARE_INITIAL_HOURS", "24"))
 COMPARE_MAX_HOURS_PER_CYCLE = int(os.environ.get("COMPARE_MAX_HOURS_PER_CYCLE", "3"))
+# One-shot backfill: seconds to wait between hours, so InfluxDB can flush / compact the
+# ~40k new series each hour creates (the 2026-11-11 backfill without a pause drove influxd into swap)
+COMPARE_BACKFILL_PAUSE = int(os.environ.get("COMPARE_BACKFILL_PAUSE", "60"))
 COMPARE_CHECKPOINT_FILE = os.environ.get("COMPARE_CHECKPOINT_FILE", "/data/compare_checkpoint.json")
+# 2026-11-12: write to a new measurement, and keep country x ASN rows only for networks with at
+# least COMPARE_MIN_TESTS F5 tests in that hour (0 = keep all, the old behaviour). The all-countries
+# backfill wrote ~710k series to perfops_cdn_compare, mostly networks with 0-2 F5 tests, which made
+# 7-day panels time out. Test counts come from perfops_cdn_net (downsample-10m-net task) in
+# COMPARE_COUNT_BUCKET, so the exporter's token needs READ access to that bucket.
+COMPARE_MEASUREMENT = os.environ.get("COMPARE_MEASUREMENT", "perfops_cdn_cmp")
+COMPARE_MIN_TESTS = float(os.environ.get("COMPARE_MIN_TESTS", "5"))
+COMPARE_COUNT_BUCKET = os.environ.get("COMPARE_COUNT_BUCKET", "perfops-cdn-10m")
+# If the count query finds NO F5 networks for an hour younger than this, retry later (the net task
+# may not have run yet). Older hours are written without ASN rows, with a warning.
+COMPARE_COUNT_WAIT_HOURS = int(os.environ.get("COMPARE_COUNT_WAIT_HOURS", "3"))
 DATA_URL = "https://api.perfops.net/analytics/cdn/data"
 COUNTRIES_URL = "https://api.perfops.net/analytics/cdn/countries"
 COMPARE_FUNCS = {"MEAN": "mean_ms", "MEDIAN": "median_ms", "PERCENTILE_95": "p95_ms", "TCPTIME": "tcp_ms",
@@ -112,12 +127,13 @@ MIN_SPLIT_SECONDS = int(os.environ.get("MIN_SPLIT_SECONDS", "10"))
 FETCH_OK, FETCH_TRUNCATED, FETCH_FAILED = "ok", "truncated", "failed"
 
 GEO_OVERRIDES = {
-    "Ashburn|United States":  [39.0438, -77.4874],
-    "Pasco|United States":    [46.2396, -119.1006],
-    "Suffolk|United States":  [36.7282, -76.5836],
-    "Alameda|United States":  [37.7652, -122.2416],
-    "Dnipro|Ukraine":         [48.4647, 35.0462],
-    "Ain Beida|Algeria":      [35.7964, 7.3928],
+    "Ashburn|United States":     [39.0438, -77.4874],
+    "Pasco|United States":       [46.2396, -119.1006],
+    "Suffolk|United States":     [36.7282, -76.5836],
+    "Alameda|United States":     [37.7652, -122.2416],
+    "Santa Clara|United States": [37.3541, -121.9552],
+    "Dnipro|Ukraine":            [48.4647, 35.0462],
+    "Ain Beida|Algeria":         [35.7964, 7.3928],
 }
 
 _geolocator = Nominatim(user_agent=GEOCODER_USER_AGENT, timeout=10)
@@ -161,7 +177,11 @@ def get_city_coords(city, country):
         query = city
 
     try:
-        loc = _geocode(query, **kwargs)
+        # Prefer populated settlements (cities, towns, villages, suburbs) so Nominatim
+        # doesn't match a same-named administrative county boundary (e.g. Santa Clara County).
+        loc = _geocode(query, featuretype="settlement", **kwargs)
+        if loc is None:
+            loc = _geocode(query, **kwargs)
     except Exception as e:
         print(f"Geocoding failed for '{query}': {e}")
         return None
@@ -836,6 +856,53 @@ def _compare_rows(body):
             out.setdefault(key, {})[field] = float(y)
     return out
 
+influx_client = None             # set in main; used for the test-count query
+
+def anchor_tests(hour_start):
+    """F5 tests per (country name, asn) in [hour_start, +1h) from perfops_cdn_net.
+    Returns (dict, by_asn dict) or None if the query failed."""
+    t0 = hour_start.strftime('%Y-%m-%dT%H:%M:%SZ')
+    t1 = (hour_start + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    flux = f'''
+from(bucket: "{COMPARE_COUNT_BUCKET}")
+  |> range(start: {t0}, stop: {t1})
+  |> filter(fn: (r) => r._measurement == "perfops_cdn_net" and r._field == "net_tests")
+  |> filter(fn: (r) => r.provider_name == "{COMPARE_ANCHOR}")
+  |> group(columns: ["country", "asn"])
+  |> sum()
+'''
+    try:
+        tables = influx_client.query_api().query(flux, org=INFLUXDB_ORG)
+    except ApiException as e:
+        print(f"[compare] test-count query on '{COMPARE_COUNT_BUCKET}' failed ({e.status}): "
+              f"{(e.body or '').strip()[:300]}"
+              + ("  -> the exporter token needs READ access to that bucket" if e.status in (401, 403) else ""))
+        return None
+    except Exception as e:
+        print(f"[compare] test-count query failed: {e}")
+        return None
+    counts, by_asn = {}, {}
+    for t in tables:
+        for rec in t.records:
+            c, a, v = str(rec.values.get("country")), str(rec.values.get("asn")), float(rec.get_value() or 0)
+            counts[(c, a)] = counts.get((c, a), 0.0) + v
+            by_asn[a] = by_asn.get(a, 0.0) + v
+    return counts, by_asn
+
+_warned_countries = set()
+
+def keep_asn_row(country_name, asn, counts, by_asn, net_countries):
+    """True if F5 had >= COMPARE_MIN_TESTS tests on this country x ASN in the hour. If PerfOps'
+    country name doesn't appear in our raw data at all (spelling differs), match on the ASN alone."""
+    if not net_countries:
+        return False
+    if country_name in net_countries:
+        return counts.get((country_name, asn), 0.0) >= COMPARE_MIN_TESTS
+    if country_name not in _warned_countries:
+        _warned_countries.add(country_name)
+        print(f"[compare] note: country '{country_name}' not in perfops_cdn_net; matching its ASNs on ASN only")
+    return by_asn.get(asn, 0.0) >= COMPARE_MIN_TESTS
+
 def compare_hour(write_api, hour_start):
     """Collect and write one hour. Returns True on success."""
     f = '%Y-%m-%d %H:%M:%S'
@@ -849,6 +916,23 @@ def compare_hour(write_api, hour_start):
         print(f"[compare] anchor CDN '{COMPARE_ANCHOR}' not resolved; skipping")
         return False
 
+    # F5 test counts per network for this hour (skipped when COMPARE_MIN_TESTS = 0)
+    counts = by_asn = None
+    if COMPARE_MIN_TESTS > 0:
+        res = anchor_tests(hour_start)
+        if res is None:
+            return False
+        counts, by_asn = res
+        if not counts:
+            age_h = (datetime.now(timezone.utc) - hour_start).total_seconds() / 3600
+            if age_h < COMPARE_COUNT_WAIT_HOURS:
+                print(f"[compare] {hour_start:%Y-%m-%d %H:00}: no F5 test counts yet in "
+                      f"'{COMPARE_COUNT_BUCKET}'; will retry")
+                return False
+            print(f"[compare] WARNING {hour_start:%Y-%m-%d %H:00}: no F5 test counts in "
+                  f"'{COMPARE_COUNT_BUCKET}' (net task not running?); writing country/global rows only")
+    net_countries = {c for c, _ in counts} if counts else set()
+
     rows = {}
     # 1. country x ASN, one CDN per call; competitors limited to the anchor's pairs
     anchor_pairs = None
@@ -859,6 +943,10 @@ def compare_hour(write_api, hour_start):
             return False
         r = _compare_rows(body)
         if anchor_pairs is None:
+            if counts is not None:
+                r = {k: v for k, v in r.items()
+                     if keep_asn_row(compare_countries.get(k[1], f"C_{k[1]}"), k[2],
+                                     counts, by_asn, net_countries)}
             anchor_pairs = {(k[1], k[2]) for k in r}
         else:
             r = {k: v for k, v in r.items() if (k[1], k[2]) in anchor_pairs}
@@ -874,7 +962,7 @@ def compare_hour(write_api, hour_start):
     ts = int(hour_start.timestamp() * 1e9)
     points = []
     for (cdnid, country, asn), fields in rows.items():
-        p = Point("perfops_cdn_compare") \
+        p = Point(COMPARE_MEASUREMENT) \
             .tag("provider_name", get_provider_name(cdnid)) \
             .tag("country", country if country == "_all" else compare_countries.get(country, f"C_{country}")) \
             .tag("asn", asn) \
@@ -890,6 +978,15 @@ def compare_hour(write_api, hour_start):
                 write_api.write(bucket=COMPARE_BUCKET, org=INFLUXDB_ORG, record=batch)
                 ok = True
                 break
+            except ApiException as e:
+                # 4xx other than 429 (e.g. 403: token can't write COMPARE_BUCKET) won't fix itself:
+                # give up at once so the raw-log fetch isn't held up by retry sleeps
+                if e.status and 400 <= e.status < 500 and e.status != 429:
+                    print(f"[compare] write to bucket '{COMPARE_BUCKET}' failed ({e.status}): "
+                          f"{(e.body or '').strip()[:300]}")
+                    return False
+                print(f"[compare] write error ({attempt}/{INFLUX_WRITE_RETRIES}): HTTP {e.status}")
+                time.sleep(min(60, 5 * 2 ** (attempt - 1)))
             except Exception as e:
                 print(f"[compare] write error ({attempt}/{INFLUX_WRITE_RETRIES}): {e}")
                 time.sleep(min(60, 5 * 2 ** (attempt - 1)))
@@ -897,7 +994,7 @@ def compare_hour(write_api, hour_start):
             return False
     n_asn = sum(1 for k in rows if k[2] != "_all")
     print(f"[compare] {hour_start:%Y-%m-%d %H:00} UTC: {len(points)} points "
-          f"({n_asn} country x ASN, {len(ids)} CDNs)")
+          f"({n_asn} country x ASN, {len(ids)} CDNs, min {COMPARE_MIN_TESTS:g} F5 tests) -> {COMPARE_MEASUREMENT}")
     return True
 
 def load_compare_checkpoint():
@@ -946,16 +1043,21 @@ def compare_backfill(write_api, start, end):
         print("[compare] provider / country list could not be loaded")
         return False
     h = start.replace(minute=0, second=0, microsecond=0)
+    print(f"[compare] backfill pacing: {COMPARE_BACKFILL_PAUSE}s between hours; ASN-level countries: "
+          f"{COMPARE_COUNTRIES or 'all'}")
     while h < end:
         for attempt in range(1, 4):
             if compare_hour(write_api, h):
                 break
-            time.sleep(30 * attempt)
+            # InfluxDB is struggling: back off hard instead of adding load
+            time.sleep(120 * attempt)
         else:
             print(f"[compare] giving up at {h}. Resume with --compare-start '{h.isoformat()}' "
                   f"--compare-end '{end.isoformat()}'")
             return False
         h += timedelta(hours=1)
+        if h < end and COMPARE_BACKFILL_PAUSE > 0:
+            time.sleep(COMPARE_BACKFILL_PAUSE)
     return True
 
 # --- Main Execution ---
@@ -983,6 +1085,7 @@ if __name__ == '__main__':
     client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG,
                             timeout=INFLUX_TIMEOUT_MS)
     write_api = client.write_api(write_options=SYNCHRONOUS)
+    influx_client = client
 
     if args.compare_start:
         start, end = parse_utc(args.compare_start), parse_utc(args.compare_end)
@@ -1012,7 +1115,9 @@ if __name__ == '__main__':
 
     ensure_providers()
     print(f"Starting PerfOps to InfluxDB exporter. Writing to {INFLUXDB_URL} / bucket: {INFLUXDB_BUCKET} "
-          f"(NETWORK_TAGS={NETWORK_TAGS}, COMPARE={'on' if COMPARE else 'off'})")
+          f"(NETWORK_TAGS={NETWORK_TAGS}, COMPARE={'on' if COMPARE else 'off'}"
+          + (f" -> {COMPARE_MEASUREMENT}, min {COMPARE_MIN_TESTS:g} F5 tests per network-hour" if COMPARE else "")
+          + ")")
     
     try:
         while True:
